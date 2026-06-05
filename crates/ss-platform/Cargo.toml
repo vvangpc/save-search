@@ -1,0 +1,12 @@
+[package]
+name = "ss-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+] }
+thiserror.workspace = true

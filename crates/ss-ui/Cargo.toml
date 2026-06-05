@@ -1,0 +1,8 @@
+[package]
+name = "ss-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 阶段1 加入：native-windows-gui / native-windows-derive / windows

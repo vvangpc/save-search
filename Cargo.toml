@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+authors = ["SaveSearch"]
+
+[workspace.dependencies]
+# 外部依赖（统一版本，避免 windows 多版本重复编译）
+windows = "0.62"
+windows-core = "0.62"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+memchr = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "5"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"
+thiserror = "2"
+
+# 内部 crate
+ss-platform = { path = "crates/ss-platform" }
+ss-core = { path = "crates/ss-core" }
+ss-shell = { path = "crates/ss-shell" }
+ss-config = { path = "crates/ss-config" }
+ss-ui = { path = "crates/ss-ui" }
+
+# 体积/内存优先的 release profile（见计划）
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# 开发期保持较快编译
+[profile.dev]
+opt-level = 1

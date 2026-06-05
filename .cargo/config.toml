@@ -1,0 +1,3 @@
+# 静态链接 CRT：单 exe 无需 VC++ 运行库，安装版更稳定
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

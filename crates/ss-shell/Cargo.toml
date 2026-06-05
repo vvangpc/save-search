@@ -1,0 +1,18 @@
+[package]
+name = "ss-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ss-platform = { workspace = true }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Variant",
+    "Win32_System_Ole",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+] }

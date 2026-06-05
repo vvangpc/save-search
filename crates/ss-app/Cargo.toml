@@ -1,0 +1,32 @@
+[package]
+name = "ss-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ss-app"
+path = "src/main.rs"
+
+[dependencies]
+ss-core = { workspace = true }
+ss-shell = { workspace = true }
+ss-config = { workspace = true }
+parking_lot = { workspace = true }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Accessibility",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+] }
+
+# 后续阶段接入内部 crate：ss-ui, ss-config
+
+[build-dependencies]
+embed-resource = "2"
