@@ -101,6 +101,8 @@ pub struct Settings {
     pub theme: String,
     /// 索引的盘符（大写）；空 = 全部固定 NTFS 盘
     pub indexed_drives: Vec<char>,
+    /// 预设文件夹（完整路径）：出现在搜索范围下拉框中，选中后只在该文件夹子树内搜索
+    pub preset_folders: Vec<String>,
     /// 搜索结果上限
     pub result_limit: usize,
     /// 浮窗「最近位置」保留条数
@@ -119,6 +121,7 @@ impl Default for Settings {
         Settings {
             theme: "business_light".into(),
             indexed_drives: Vec::new(),
+            preset_folders: Vec::new(),
             result_limit: 200,
             recent_max: 2,
             autostart: false,

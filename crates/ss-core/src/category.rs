@@ -7,8 +7,7 @@ pub enum Category {
     Folder,
     Document,
     Image,
-    Video,
-    Audio,
+    Archive,
     Other,
 }
 
@@ -19,10 +18,10 @@ const DOCUMENT: &[&str] = &[
 const IMAGE: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff", "svg", "ico", "heic", "raw", "psd",
 ];
-const VIDEO: &[&str] = &[
-    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "ts", "3gp", "rmvb",
+const ARCHIVE: &[&str] = &[
+    "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst", "cab", "iso", "tgz", "tbz2", "lz", "lzma",
+    "z", "arj", "ace",
 ];
-const AUDIO: &[&str] = &["mp3", "wav", "flac", "aac", "ogg", "m4a", "wma", "opus", "aiff"];
 
 /// 取文件名小写扩展名（不含点）；无扩展名返回空。
 fn ext_lower(name: &[u8]) -> Vec<u8> {
@@ -49,11 +48,10 @@ pub fn classify(name: &[u8], is_dir: bool) -> Category {
         Category::Document
     } else if has(IMAGE) {
         Category::Image
-    } else if has(VIDEO) {
-        Category::Video
-    } else if has(AUDIO) {
-        Category::Audio
+    } else if has(ARCHIVE) {
+        Category::Archive
     } else {
+        // 音频/视频及其他未归类 → Other
         Category::Other
     }
 }

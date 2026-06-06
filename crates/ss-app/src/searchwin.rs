@@ -10,12 +10,13 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use ss_core::{Catalog, Category, SearchResult};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, DrawTextW, EndPaint, FillRect, InvalidateRect, SelectObject, SetBkMode,
-    SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DRAW_TEXT_FORMAT,
-    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT,
-    HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateFontW, DrawTextW, EndPaint, FillRect, GetDC, GetTextExtentPoint32W,
+    InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+    TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -24,7 +25,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_NEXT, VK_PRIOR, VK_RETURN, VK_UP,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::Controls::{SetScrollInfo, DRAWITEMSTRUCT, ODS_SELECTED, WM_MOUSELEAVE};
+use windows::Win32::UI::Controls::{
+    SetScrollInfo, DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_COMBOBOXEDIT, ODS_SELECTED, WM_MOUSELEAVE,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::{icons, paint, theme};
@@ -47,14 +50,16 @@ const CB_ADDSTRING: u32 = 0x0143;
 const CB_RESETCONTENT: u32 = 0x014B;
 const CB_GETCURSEL: u32 = 0x0147;
 const CB_SETCURSEL: u32 = 0x014E;
+const CB_SETDROPPEDWIDTH: u32 = 0x0160;
+const CB_GETLBTEXT: u32 = 0x0148;
+const CB_GETLBTEXTLEN: u32 = 0x0149;
 
-const CATS: [(Category, &str); 7] = [
+const CATS: [(Category, &str); 6] = [
     (Category::All, "全部"),
     (Category::Folder, "文件夹"),
     (Category::Document, "文档"),
     (Category::Image, "图片"),
-    (Category::Video, "视频"),
-    (Category::Audio, "音频"),
+    (Category::Archive, "压缩包"),
     (Category::Other, "其他"),
 ];
 
@@ -66,6 +71,8 @@ mod st {
     pub const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
     pub const ES_AUTOHSCROLL: u32 = 0x0080;
     pub const CBS_DROPDOWNLIST: u32 = 0x0003;
+    pub const CBS_OWNERDRAWFIXED: u32 = 0x0010;
+    pub const CBS_HASSTRINGS: u32 = 0x0200;
     pub const BS_OWNERDRAW: u32 = 0x0000_000B;
     pub const SS_LEFT: u32 = 0x0000_0000;
     pub const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
@@ -81,6 +88,7 @@ struct Ui {
     cats: Vec<HWND>,
     results: Vec<SearchResult>,
     drives: Vec<char>,
+    presets: Vec<String>,
     category: Category,
     catalog: SharedCatalog,
     font_ui: HFONT,
@@ -88,6 +96,7 @@ struct Ui {
     font_path: HFONT,
     item_h: i32,
     dpi: i32,
+    combo_w: i32,
     // 平滑滚动状态
     scroll_y: f32,
     target_y: f32,
@@ -127,6 +136,61 @@ fn handles() -> Option<(HWND, HWND, HWND)> {
 fn sc_dpi(v: i32) -> i32 {
     let dpi = UI.with(|c| c.borrow().as_ref().map(|u| u.dpi).unwrap_or(96));
     v * dpi / 96
+}
+
+/// 用指定字体测量文本像素宽度。
+fn measure_text(font: HFONT, s: &str) -> i32 {
+    if s.is_empty() {
+        return 0;
+    }
+    unsafe {
+        let hdc = GetDC(None);
+        let old = SelectObject(hdc, HGDIOBJ(font.0));
+        let w: Vec<u16> = s.encode_utf16().collect();
+        let mut size = SIZE::default();
+        let _ = GetTextExtentPoint32W(hdc, &w, &mut size);
+        SelectObject(hdc, old);
+        ReleaseDC(None, hdc);
+        size.cx
+    }
+}
+
+/// 根据当前选中项文本，自适应调整范围下拉框宽度并重排。
+fn update_combo_width() {
+    let (search, combo, font) =
+        match UI.with(|c| c.borrow().as_ref().map(|u| (u.search_hwnd, u.combo, u.font_ui))) {
+            Some(t) => t,
+            None => return,
+        };
+    let sel = send(combo, CB_GETCURSEL, 0, 0);
+    let text = if sel < 0 {
+        String::new()
+    } else {
+        let len = send(combo, CB_GETLBTEXTLEN, sel as usize, 0);
+        if len <= 0 {
+            String::new()
+        } else {
+            let mut buf = vec![0u16; len as usize + 1];
+            let n = send(combo, CB_GETLBTEXT, sel as usize, buf.as_mut_ptr() as isize);
+            String::from_utf16_lossy(&buf[..(n.max(0) as usize).min(buf.len())])
+        }
+    };
+    let tw = measure_text(font, &text);
+    let mut client = RECT::default();
+    let _ = unsafe { GetClientRect(search, &mut client) };
+    let cw_total = client.right - client.left;
+    let m = sc_dpi(10);
+    let min_w = sc_dpi(110);
+    let max_w = (cw_total - 2 * m - sc_dpi(6) - sc_dpi(180)).max(min_w);
+    let w = (tw + sc_dpi(40)).clamp(min_w, max_w);
+    UI.with(|c| {
+        if let Some(u) = c.borrow_mut().as_mut() {
+            u.combo_w = w;
+        }
+    });
+    unsafe {
+        layout(search);
+    }
 }
 
 pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
@@ -181,7 +245,13 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
             w!("COMBOBOX"),
             PCWSTR::null(),
             WINDOW_STYLE(
-                st::WS_CHILD | st::WS_VISIBLE | st::WS_TABSTOP | st::WS_VSCROLL | st::CBS_DROPDOWNLIST,
+                st::WS_CHILD
+                    | st::WS_VISIBLE
+                    | st::WS_TABSTOP
+                    | st::WS_VSCROLL
+                    | st::CBS_DROPDOWNLIST
+                    | st::CBS_OWNERDRAWFIXED
+                    | st::CBS_HASSTRINGS,
             ),
             0, 0, 10, 260,
             Some(hwnd),
@@ -248,6 +318,7 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
                 cats,
                 results: Vec::new(),
                 drives: Vec::new(),
+                presets: Vec::new(),
                 category: Category::All,
                 catalog,
                 font_ui,
@@ -255,6 +326,7 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
                 font_path,
                 item_h: sc(46),
                 dpi,
+                combo_w: sc(110),
                 scroll_y: 0.0,
                 target_y: 0.0,
                 sel: -1,
@@ -278,7 +350,7 @@ unsafe fn layout(hwnd: HWND) {
     let h = rc.bottom - rc.top;
     let m = sc_dpi(10);
     let eh = sc_dpi(30);
-    let cw = sc_dpi(92);
+    let cw = UI.with(|c| c.borrow().as_ref().map(|u| u.combo_w).unwrap_or(sc_dpi(110)));
     let cath = sc_dpi(30);
     let counth = sc_dpi(20);
     // 先取句柄并释放借用，再在借用外 MoveWindow——MoveWindow(list) 会同步回调
@@ -332,9 +404,10 @@ fn set_text(hwnd: HWND, s: &str) {
     }
 }
 
-fn populate_drives() {
-    let (combo, cat_arc) =
-        match UI.with(|c| c.borrow().as_ref().map(|u| (u.combo, u.catalog.clone()))) {
+/// 重建搜索范围下拉框：全部盘 + 各盘 + 预设文件夹。索引就绪后或设置变更后调用。
+pub fn refresh_scopes() {
+    let (combo, cat_arc, font) =
+        match UI.with(|c| c.borrow().as_ref().map(|u| (u.combo, u.catalog.clone(), u.font_ui))) {
             Some(t) => t,
             None => return,
         };
@@ -345,29 +418,51 @@ fn populate_drives() {
             None => return,
         }
     };
+    let presets = ss_config::load_settings().preset_folders;
     send(combo, CB_RESETCONTENT, 0, 0);
     add_combo(combo, "全部盘");
+    let mut maxw = measure_text(font, "全部盘");
     for d in &letters {
-        add_combo(combo, &format!("{}:", d));
+        let s = format!("{}:", d);
+        maxw = maxw.max(measure_text(font, &s));
+        add_combo(combo, &s);
     }
+    for f in &presets {
+        let s = format!("📁 {f}");
+        maxw = maxw.max(measure_text(font, &s));
+        add_combo(combo, &s);
+    }
+    // 下拉列表宽度按最长项自适应，便于看清完整预设文件夹路径
+    send(combo, CB_SETDROPPEDWIDTH, (maxw + sc_dpi(36)) as usize, 0);
     send(combo, CB_SETCURSEL, 0, 0);
     UI.with(|c| {
         if let Some(ui) = c.borrow_mut().as_mut() {
             ui.drives = letters;
+            ui.presets = presets;
         }
     });
+    update_combo_width();
     do_search();
 }
 
-fn selected_drive(combo: HWND) -> Option<char> {
+/// 当前下拉选择 → (盘符过滤, 文件夹过滤)。0=全部盘；1..=盘符；其后=预设文件夹。
+fn selected_scope(combo: HWND) -> (Option<char>, Option<String>) {
     let sel = send(combo, CB_GETCURSEL, 0, 0);
     if sel <= 0 {
-        return None;
+        return (None, None);
     }
     UI.with(|c| {
-        c.borrow()
-            .as_ref()
-            .and_then(|ui| ui.drives.get((sel - 1) as usize).copied())
+        let b = c.borrow();
+        let Some(ui) = b.as_ref() else {
+            return (None, None);
+        };
+        let i = sel as usize;
+        if i <= ui.drives.len() {
+            (ui.drives.get(i - 1).copied(), None)
+        } else {
+            let pi = i - 1 - ui.drives.len();
+            (None, ui.presets.get(pi).cloned())
+        }
     })
 }
 
@@ -385,12 +480,12 @@ fn do_search() {
     let results = if q.is_empty() {
         Vec::new()
     } else {
-        let drive = selected_drive(combo);
+        let (drive, folder) = selected_scope(combo);
         let limit = ss_config::load_settings().result_limit.max(1);
         let cat_arc = UI.with(|c| c.borrow().as_ref().map(|u| u.catalog.clone()));
         match cat_arc {
             Some(arc) => match arc.read().as_ref() {
-                Some(cat) => cat.search(q, drive, category, limit),
+                Some(cat) => cat.search(q, drive, folder.as_deref(), category, limit),
                 None => Vec::new(),
             },
             None => Vec::new(),
@@ -539,7 +634,7 @@ pub fn pretranslate(msg: &MSG) -> bool {
     true
 }
 
-// ---- 分类标签自绘 ----
+// ---- 分类标签 / 下拉框 自绘 ----
 
 unsafe fn draw_text(hdc: HDC, s: &str, rect: &mut RECT, color: u32, font: HFONT, flags: DRAW_TEXT_FORMAT) {
     if s.is_empty() {
@@ -549,6 +644,36 @@ unsafe fn draw_text(hdc: HDC, s: &str, rect: &mut RECT, color: u32, font: HFONT,
     SetTextColor(hdc, COLORREF(color));
     let mut buf: Vec<u16> = s.encode_utf16().collect();
     DrawTextW(hdc, &mut buf, rect, flags);
+}
+
+/// 自绘范围下拉框（主题色）。关闭显示区(ODS_COMBOBOXEDIT)与下拉项分别着色。
+unsafe fn draw_combo_item(dis: &DRAWITEMSTRUCT) {
+    let t = theme::current();
+    let is_edit = dis.itemState.0 & ODS_COMBOBOXEDIT.0 != 0;
+    let selected = dis.itemState.0 & ODS_SELECTED.0 != 0;
+    let bg = if !is_edit && selected { t.sel_bg } else { t.alt_bg };
+    let fg = if !is_edit && selected { t.sel_fg } else { t.fg };
+    let rc = dis.rcItem;
+    FillRect(dis.hDC, &rc, theme::solid_brush(bg));
+    if dis.itemID != u32::MAX {
+        let combo = dis.hwndItem;
+        let len = send(combo, CB_GETLBTEXTLEN, dis.itemID as usize, 0);
+        if len > 0 {
+            let mut buf = vec![0u16; len as usize + 1];
+            let n = send(combo, CB_GETLBTEXT, dis.itemID as usize, buf.as_mut_ptr() as isize);
+            let s = String::from_utf16_lossy(&buf[..(n.max(0) as usize).min(buf.len())]);
+            SetBkMode(dis.hDC, TRANSPARENT);
+            let font =
+                UI.with(|c| c.borrow().as_ref().map(|u| u.font_ui).unwrap_or(HFONT(std::ptr::null_mut())));
+            let mut r = RECT {
+                left: rc.left + sc_dpi(6),
+                top: rc.top,
+                right: rc.right - sc_dpi(4),
+                bottom: rc.bottom,
+            };
+            draw_text(dis.hDC, &s, &mut r, fg, font, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
+    }
 }
 
 unsafe fn draw_cat_button(dis: &DRAWITEMSTRUCT) {
@@ -937,13 +1062,22 @@ unsafe extern "system" fn results_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_APP_INDEX_READY => {
-            populate_drives();
+            refresh_scopes();
             LRESULT(0)
         }
         WM_DRAWITEM => {
             let dis = &*(lp.0 as *const DRAWITEMSTRUCT);
-            if dis.CtlID >= CAT_BASE && (dis.CtlID as usize) < CAT_BASE as usize + CATS.len() {
+            if dis.CtlID == COMBO_ID {
+                draw_combo_item(dis);
+            } else if dis.CtlID >= CAT_BASE && (dis.CtlID as usize) < CAT_BASE as usize + CATS.len() {
                 draw_cat_button(dis);
+            }
+            LRESULT(1)
+        }
+        WM_MEASUREITEM => {
+            let mis = &mut *(lp.0 as *mut MEASUREITEMSTRUCT);
+            if mis.CtlID == COMBO_ID {
+                mis.itemHeight = sc_dpi(22) as u32;
             }
             LRESULT(1)
         }
@@ -968,6 +1102,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if id == EDIT_ID && code == EN_CHANGE {
                 do_search();
             } else if id == COMBO_ID && code == CBN_SELCHANGE {
+                update_combo_width();
                 do_search();
             } else if id >= CAT_BASE && (id as usize) < CAT_BASE as usize + CATS.len() {
                 let cat = CATS[(id - CAT_BASE) as usize].0;

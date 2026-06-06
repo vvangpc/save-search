@@ -11,8 +11,10 @@ use windows::Win32::Graphics::Gdi::{
     CreateFontW, FillRect, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
     DEFAULT_CHARSET, HDC, HFONT, OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, FOS_PICKFOLDERS, SIGDN_FILESYSPATH};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::theme;
@@ -25,6 +27,9 @@ const ID_POPUP: u32 = 1005;
 const ID_FAV: u32 = 1006;
 const ID_RECENTSHOW: u32 = 1007;
 const ID_OPEN: u32 = 1008;
+const ID_PRESET_LIST: u32 = 1009;
+const ID_PRESET_ADD: u32 = 1010;
+const ID_PRESET_DEL: u32 = 1011;
 const ID_DRIVE_BASE: u32 = 1100;
 const IDOK: u32 = 1;
 const IDCANCEL: u32 = 2;
@@ -43,6 +48,10 @@ mod st {
     pub const BS_AUTOCHECKBOX: u32 = 0x0003;
     pub const BS_DEFPUSHBUTTON: u32 = 0x0001;
     pub const CBS_DROPDOWNLIST: u32 = 0x0003;
+    pub const WS_BORDER: u32 = 0x0080_0000;
+    pub const LBS_NOTIFY: u32 = 0x0001;
+    pub const LBS_HASSTRINGS: u32 = 0x0040;
+    pub const LBS_NOINTEGRALHEIGHT: u32 = 0x0100;
     pub const ES_NUMBER: u32 = 0x2000;
     pub const ES_AUTOHSCROLL: u32 = 0x0080;
     pub const SS_LEFT: u32 = 0x0000;
@@ -66,6 +75,7 @@ struct SUi {
     fav: HWND,
     recent_show: HWND,
     open: HWND,
+    preset_list: HWND,
     drives: Vec<(char, HWND)>,
     font: HFONT,
 }
@@ -107,6 +117,39 @@ fn set_text(hwnd: HWND, s: &str) {
     }
 }
 
+/// 弹出系统「选择文件夹」对话框，返回所选完整路径。
+unsafe fn pick_folder(owner: HWND) -> Option<String> {
+    let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+    let opts = dlg.GetOptions().ok()?;
+    dlg.SetOptions(opts | FOS_PICKFOLDERS).ok()?;
+    if dlg.Show(Some(owner)).is_err() {
+        return None; // 用户取消
+    }
+    let item = dlg.GetResult().ok()?;
+    let pw = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+    let s = pw.to_string().ok()?;
+    CoTaskMemFree(Some(pw.0 as *const c_void));
+    Some(s)
+}
+
+/// 读取列表框全部条目。
+fn listbox_items(list: HWND) -> Vec<String> {
+    let mut out = Vec::new();
+    let count = send(list, LB_GETCOUNT, 0, 0);
+    for i in 0..count.max(0) {
+        let len = send(list, LB_GETTEXTLEN, i as usize, 0);
+        if len <= 0 {
+            continue;
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let n = send(list, LB_GETTEXT, i as usize, buf.as_mut_ptr() as isize);
+        if n > 0 {
+            out.push(String::from_utf16_lossy(&buf[..(n as usize).min(buf.len())]));
+        }
+    }
+    out
+}
+
 /// 打开设置窗口（若已开则前置）。
 pub fn open() {
     if let Some(h) = SUI.with(|c| c.borrow().as_ref().map(|u| u.hwnd)) {
@@ -133,7 +176,7 @@ unsafe fn create() -> windows::core::Result<()> {
 
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);
-    let (ww, wh) = (460, 520);
+    let (ww, wh) = (460, 660);
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         class,
@@ -288,6 +331,60 @@ unsafe fn create() -> windows::core::Result<()> {
     let open = mkcheck("显示 已打开", ID_OPEN, 276, y, 130);
     set_checked(open, s.popup_show_open);
 
+    // 预设文件夹
+    y += 36;
+    mklabel("预设文件夹（搜索范围下拉可选，仅搜该文件夹）", 16, y, 420);
+    y += 22;
+    let preset_list = CreateWindowExW(
+        WINDOW_EX_STYLE(st::WS_EX_CLIENTEDGE),
+        w!("LISTBOX"),
+        PCWSTR::null(),
+        WINDOW_STYLE(
+            st::WS_CHILD
+                | st::WS_VISIBLE
+                | st::WS_TABSTOP
+                | st::WS_VSCROLL
+                | st::LBS_NOTIFY
+                | st::LBS_HASSTRINGS
+                | st::LBS_NOINTEGRALHEIGHT,
+        ),
+        sc(16),
+        sc(y),
+        sc(296),
+        sc(96),
+        Some(hwnd),
+        Some(HMENU(ID_PRESET_LIST as usize as *mut c_void)),
+        Some(hinstance),
+        None,
+    )?;
+    send(preset_list, WM_SETFONT, font.0 as usize, 1);
+    for f in &s.preset_folders {
+        let wf = crate::wide(f);
+        send(preset_list, LB_ADDSTRING, 0, wf.as_ptr() as isize);
+    }
+    let mkbtn = |text: &str, id: u32, bx: i32, by: i32| {
+        let wl = crate::wide(text);
+        let h = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("BUTTON"),
+            PCWSTR(wl.as_ptr()),
+            WINDOW_STYLE(st::WS_CHILD | st::WS_VISIBLE | st::WS_TABSTOP),
+            sc(bx),
+            sc(by),
+            sc(118),
+            sc(28),
+            Some(hwnd),
+            Some(HMENU(id as usize as *mut c_void)),
+            Some(hinstance),
+            None,
+        )
+        .unwrap_or(HWND(std::ptr::null_mut()));
+        send(h, WM_SETFONT, font.0 as usize, 1);
+    };
+    mkbtn("添加文件夹…", ID_PRESET_ADD, 320, y);
+    mkbtn("删除", ID_PRESET_DEL, 320, y + 34);
+    y += 96 + 14;
+
     y += 44;
     let wl_ok = crate::wide("保存");
     let ok = CreateWindowExW(
@@ -333,6 +430,7 @@ unsafe fn create() -> windows::core::Result<()> {
             fav,
             recent_show,
             open,
+            preset_list,
             drives,
             font,
         });
@@ -367,6 +465,7 @@ fn apply_and_close() {
         Some(ss_config::Settings {
             theme: theme.to_string(),
             indexed_drives: drives,
+            preset_folders: listbox_items(u.preset_list),
             result_limit: limit,
             recent_max,
             autostart: checked(u.autostart),
@@ -380,6 +479,7 @@ fn apply_and_close() {
         ss_config::save_settings(&s);
         theme::set_current(theme::theme_by_name(&s.theme));
         crate::searchwin::refresh_theme();
+        crate::searchwin::refresh_scopes(); // 预设文件夹变更后刷新下拉
         crate::set_autostart(s.autostart);
     }
     if let Some(h) = SUI.with(|c| c.borrow().as_ref().map(|u| u.hwnd)) {
@@ -416,6 +516,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 IDOK => apply_and_close(),
                 IDCANCEL => {
                     let _ = DestroyWindow(hwnd);
+                }
+                ID_PRESET_ADD => {
+                    if let Some(list) = SUI.with(|c| c.borrow().as_ref().map(|u| u.preset_list)) {
+                        if let Some(path) = pick_folder(hwnd) {
+                            let w = crate::wide(&path);
+                            send(list, LB_ADDSTRING, 0, w.as_ptr() as isize);
+                        }
+                    }
+                }
+                ID_PRESET_DEL => {
+                    if let Some(list) = SUI.with(|c| c.borrow().as_ref().map(|u| u.preset_list)) {
+                        let sel = send(list, LB_GETCURSEL, 0, 0);
+                        if sel >= 0 {
+                            send(list, LB_DELETESTRING, sel as usize, 0);
+                        }
+                    }
                 }
                 _ => {}
             }

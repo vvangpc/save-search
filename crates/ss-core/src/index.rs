@@ -283,6 +283,88 @@ impl Index {
             .collect()
     }
 
+    /// 节点是否为 `ancestor` 的后代（含自身）。
+    fn is_descendant(&self, node: u32, ancestor: u32) -> bool {
+        let mut cur = node;
+        let mut guard = 0;
+        while cur != u32::MAX && guard < 4096 {
+            if cur == ancestor {
+                return true;
+            }
+            cur = self.parent[cur as usize];
+            guard += 1;
+        }
+        false
+    }
+
+    /// 在 `parent_id` 的直接子目录中按名字（大小写不敏感）查找。
+    fn find_child_dir(&self, parent_id: u32, name: &str) -> Option<u32> {
+        let target = name.as_bytes();
+        for id in 1..self.names_len.len() as u32 {
+            if self.parent[id as usize] == parent_id
+                && self.is_dir(id)
+                && self.name_bytes(id).eq_ignore_ascii_case(target)
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// 把完整路径（如 `D:\AI\pr-re`）解析为该盘索引内的目录节点 id。
+    pub fn find_dir_by_path(&self, path: &str) -> Option<u32> {
+        let p = path.trim_end_matches('\\');
+        let mut parts = p.split('\\');
+        let _drive = parts.next()?; // 跳过盘符 "D:"
+        let mut cur = ROOT_ID;
+        for comp in parts {
+            if comp.is_empty() {
+                continue;
+            }
+            cur = self.find_child_dir(cur, comp)?;
+        }
+        Some(cur)
+    }
+
+    /// 只在 `ancestor` 子树内搜索。
+    pub fn search_under(
+        &self,
+        query: &str,
+        category: Category,
+        ancestor: u32,
+        limit: usize,
+    ) -> Vec<SearchResult> {
+        let mut out = Vec::new();
+        if query.is_empty() {
+            return out;
+        }
+        let q: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
+        for id in 1..self.names_len.len() as u32 {
+            if self.is_deleted(id) {
+                continue;
+            }
+            let nb = self.name_bytes(id);
+            if !contains_ci(nb, &q) {
+                continue;
+            }
+            if !crate::category::matches(category, nb, self.is_dir(id)) {
+                continue;
+            }
+            if !self.is_descendant(id, ancestor) {
+                continue;
+            }
+            out.push(SearchResult {
+                name: self.name(id),
+                path: self.path(id),
+                is_dir: self.is_dir(id),
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+
     // ---- USN 增量 ----
 
     fn set_name(&mut self, id: u32, name: &str) {

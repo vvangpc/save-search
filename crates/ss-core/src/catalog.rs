@@ -107,14 +107,33 @@ impl Catalog {
         self.indexes.iter().map(|i| i.memory_bytes()).sum()
     }
 
-    /// 搜索。`drive=None` 搜全部盘；`category` 按类型过滤。结果总数不超过 `limit`。
+    /// 搜索。`folder=Some(路径)` 只在该文件夹子树内搜（优先于 drive）；
+    /// 否则 `drive=None` 搜全部盘、`Some(letter)` 仅该盘。`category` 按类型过滤。
     pub fn search(
         &self,
         query: &str,
         drive: Option<char>,
+        folder: Option<&str>,
         category: Category,
         limit: usize,
     ) -> Vec<SearchResult> {
+        // 文件夹子树范围
+        if let Some(folder) = folder {
+            let dl = folder
+                .chars()
+                .next()
+                .map(|c| c.to_ascii_uppercase());
+            for idx in &self.indexes {
+                if Some(idx.drive_letter()) == dl {
+                    return match idx.find_dir_by_path(folder) {
+                        Some(anc) => idx.search_under(query, category, anc, limit),
+                        None => Vec::new(),
+                    };
+                }
+            }
+            return Vec::new();
+        }
+
         let mut out = Vec::new();
         let want = drive.map(|d| d.to_ascii_uppercase());
         for idx in &self.indexes {
