@@ -7,6 +7,10 @@ license.workspace = true
 [[bin]]
 name = "ss-app"
 path = "src/main.rs"
+# GUI 程序内嵌 requireAdministrator 清单；`cargo test` 会为 bin 生成测试 harness 并尝试
+# 直接运行 → 非提权环境下报 os error 740（需要提升）。本 bin 无单元测试，禁用其测试目标，
+# 让 `cargo test`（本地与 CI）只跑库 crate 的测试。
+test = false
 
 [dependencies]
 ss-core = { workspace = true }
@@ -27,8 +31,6 @@ windows = { workspace = true, features = [
     "Win32_Storage_FileSystem",
     "Win32_UI_HiDpi",
 ] }
-
-# 后续阶段接入内部 crate：ss-ui, ss-config
 
 [build-dependencies]
 embed-resource = "2"

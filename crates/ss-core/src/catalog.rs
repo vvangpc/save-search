@@ -43,7 +43,10 @@ impl Catalog {
             if let Some(idx) = Self::try_load(cache_dir, letter) {
                 indexes.push(idx);
             } else if let Ok(idx) = build_index_for_drive(letter) {
-                let _ = persist::save_index(&idx, &cache_path(cache_dir, letter));
+                if let Err(_e) = persist::save_index(&idx, &cache_path(cache_dir, letter)) {
+                    #[cfg(debug_assertions)]
+                    eprintln!("SaveSearch 保存索引({letter})失败: {}", _e);
+                }
                 indexes.push(idx);
             }
         }
@@ -90,7 +93,10 @@ impl Catalog {
     pub fn save_all(&self, cache_dir: &Path) {
         let _ = std::fs::create_dir_all(cache_dir);
         for idx in &self.indexes {
-            let _ = persist::save_index(idx, &cache_path(cache_dir, idx.drive_letter()));
+            if let Err(_e) = persist::save_index(idx, &cache_path(cache_dir, idx.drive_letter())) {
+                #[cfg(debug_assertions)]
+                eprintln!("SaveSearch 保存索引({})失败: {}", idx.drive_letter(), _e);
+            }
         }
     }
 

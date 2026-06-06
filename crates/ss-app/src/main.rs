@@ -63,6 +63,31 @@ pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// 从 exe 资源（app.rc 的 `1 ICON "app.ico"`）加载应用图标。
+/// `cx==0 && cy==0` 取默认大图标尺寸；否则按指定像素尺寸。
+/// `LR_SHARED` → 句柄由系统管理，免 `DestroyIcon`，重复加载不泄漏。
+pub(crate) fn load_app_icon(cx: i32, cy: i32) -> Option<HICON> {
+    unsafe {
+        let hmod = GetModuleHandleW(None).ok()?;
+        let flags = if cx == 0 && cy == 0 {
+            LR_DEFAULTSIZE | LR_SHARED
+        } else {
+            LR_SHARED
+        };
+        // windows-rs 0.62 无 MAKEINTRESOURCEW：数字资源 id 用伪指针 PCWSTR(id as _)。
+        let h = LoadImageW(
+            Some(HINSTANCE(hmod.0)),
+            PCWSTR(1usize as *const u16),
+            IMAGE_ICON,
+            cx,
+            cy,
+            flags,
+        )
+        .ok()?; // LoadImageW 返回 HANDLE
+        Some(HICON(h.0)) // HANDLE → HICON（同构，取裸指针）
+    }
+}
+
 unsafe fn add_tray(hwnd: HWND) {
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -72,7 +97,8 @@ unsafe fn add_tray(hwnd: HWND) {
         uCallbackMessage: WM_TRAY_CALLBACK,
         ..Default::default()
     };
-    if let Ok(icon) = LoadIconW(None, IDI_APPLICATION) {
+    // 托盘按系统小图标尺寸加载自有图标（替代系统默认灰齿轮）。
+    if let Some(icon) = load_app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) {
         nid.hIcon = icon;
     }
     fill_u16(&mut nid.szTip, "SaveSearch — 文件搜索 / 保存位置快选");
@@ -331,6 +357,8 @@ unsafe extern "system" fn win_event_proc(
 fn build_popup_entries() -> Vec<(dlgpopup::EntryKind, String)> {
     use dlgpopup::EntryKind;
     let s = ss_config::load_settings();
+    // 顺序即优先级：收藏 > 已打开 > 最近。seen 去重为 first-seen-wins，
+    // 同一路径只保留最高优先级来源。务必保持下面三个采集块的先后顺序。
     let mut out: Vec<(EntryKind, String)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     let mut add = |kind: EntryKind, path: String| {

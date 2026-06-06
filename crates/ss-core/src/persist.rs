@@ -70,6 +70,7 @@ pub fn save_index(idx: &Index, path: &Path) -> io::Result<()> {
         write_vec(&mut w, &frns)?;
         write_vec(&mut w, &ids)?;
         w.flush()?;
+        w.get_ref().sync_all()?; // fsync：flush 只刷用户缓冲，sync_all 才落盘
     }
     std::fs::rename(&tmp, path)
 }

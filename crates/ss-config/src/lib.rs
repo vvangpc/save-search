@@ -2,7 +2,10 @@
 //!
 //! 均为简单的路径字符串列表，原子写（临时文件 + rename），最近列表 LRU 截断。
 
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,12 +31,37 @@ fn load_list(path: &PathBuf) -> Vec<String> {
     }
 }
 
+/// 原子写 JSON：写临时文件并 `sync_all` 落盘后再 rename 替换目标。
+/// Windows 上 `std::fs::rename` 即 `MoveFileExW(REPLACE_EXISTING|COPY_ALLOWED)`，
+/// 目标已存在可原子替换；rename 遇杀软/索引器瞬时占用做短重试。
+fn atomic_write_json(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?; // fsync：内容落盘后再 rename，防崩溃留下空/半截文件
+    } // 关闭句柄后再 rename（Windows 上源句柄未关会触发共享冲突）
+    for i in 0..3 {
+        match fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) if i == 2 => {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20 * (i + 1))),
+        }
+    }
+    unreachable!()
+}
+
 fn save_list(path: &PathBuf, list: &[String]) {
-    let _ = std::fs::create_dir_all(config_dir());
     if let Ok(json) = serde_json::to_vec_pretty(list) {
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &json).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
+        if let Err(_e) = atomic_write_json(path, &json) {
+            #[cfg(debug_assertions)]
+            eprintln!("SaveSearch 写入 {:?} 失败: {}", path, _e);
         }
     }
 }
@@ -141,12 +169,10 @@ pub fn load_settings() -> Settings {
 }
 
 pub fn save_settings(s: &Settings) {
-    let _ = std::fs::create_dir_all(config_dir());
     if let Ok(json) = serde_json::to_vec_pretty(s) {
-        let p = settings_path();
-        let tmp = p.with_extension("tmp");
-        if std::fs::write(&tmp, &json).is_ok() {
-            let _ = std::fs::rename(&tmp, &p);
+        if let Err(_e) = atomic_write_json(&settings_path(), &json) {
+            #[cfg(debug_assertions)]
+            eprintln!("SaveSearch 写入 settings.json 失败: {}", _e);
         }
     }
 }

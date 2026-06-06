@@ -10,7 +10,7 @@ fn main() {
     let mut buf = String::new();
 
     let t = Instant::now();
-    let mut cat = ss_core::Catalog::build_or_load(cache);
+    let mut cat = ss_core::Catalog::build_or_load(cache, &[]);
     let load = t.elapsed();
     let _ = writeln!(
         buf,

@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+# tag 触发时创建 Release 需要写权限（普通 push/PR 不会跑 release 步骤）。
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # windows-latest 自带 rustup，但显式装 stable-msvc + clippy 更可预测；
+      # 会尊重仓库 rust-toolchain.toml（stable + x86_64-pc-windows-msvc）。
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # embed-resource 编译 app.rc（含 app.ico + manifest）依赖 Windows SDK 的 rc.exe，
+      # windows-latest 已随 VS Build Tools 预装，无需额外步骤。
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      # ss-app bin 已设 test = false（内嵌 requireAdministrator，非提权环境跑会报 os error 740），
+      # 故只跑库 crate 的单元测试。
+      - name: Test
+        run: cargo test --release --locked
+
+      # 信息性：不加 -D warnings，且 continue-on-error，绝不阻断打包。
+      - name: Clippy (informational)
+        run: cargo clippy --all-targets --release
+        continue-on-error: true
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss-app-${{ github.sha }}
+          path: target/release/ss-app.exe
+          if-no-files-found: error
+
+      - name: Package zip (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: Compress-Archive -Path target/release/ss-app.exe -DestinationPath "SaveSearch-$($env:GITHUB_REF_NAME).zip" -Force
+
+      - name: Create Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            SaveSearch-*.zip
+            target/release/ss-app.exe

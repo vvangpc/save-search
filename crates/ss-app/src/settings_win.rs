@@ -170,6 +170,7 @@ unsafe fn create() -> windows::core::Result<()> {
         hInstance: hinstance,
         lpszClassName: class,
         hCursor: LoadCursorW(None, IDC_ARROW)?,
+        hIcon: crate::load_app_icon(0, 0).unwrap_or_default(),
         ..Default::default()
     };
     RegisterClassW(&wc);

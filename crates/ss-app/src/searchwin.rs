@@ -54,13 +54,14 @@ const CB_SETDROPPEDWIDTH: u32 = 0x0160;
 const CB_GETLBTEXT: u32 = 0x0148;
 const CB_GETLBTEXTLEN: u32 = 0x0149;
 
-const CATS: [(Category, &str); 6] = [
-    (Category::All, "全部"),
-    (Category::Folder, "文件夹"),
-    (Category::Document, "文档"),
-    (Category::Image, "图片"),
-    (Category::Archive, "压缩包"),
-    (Category::Other, "其他"),
+// (分类, 标签, Segoe MDL2 Assets glyph)。glyph 已在 Win10/11 目视核验。
+const CATS: [(Category, &str, &str); 6] = [
+    (Category::All, "全部", "\u{E8A9}"),      // GridView
+    (Category::Folder, "文件夹", "\u{E8B7}"), // Folder
+    (Category::Document, "文档", "\u{E8A5}"), // Document
+    (Category::Image, "图片", "\u{EB9F}"),    // Photo（风景）
+    (Category::Archive, "压缩包", "\u{F012}"), // ZipFolder（拉链）
+    (Category::Other, "其他", "\u{E712}"),    // More（•••）
 ];
 
 mod st {
@@ -94,6 +95,7 @@ struct Ui {
     font_ui: HFONT,
     font_name: HFONT,
     font_path: HFONT,
+    font_icon: HFONT,
     item_h: i32,
     dpi: i32,
     combo_w: i32,
@@ -122,10 +124,10 @@ fn set_font(hwnd: HWND, f: HFONT) {
     send(hwnd, WM_SETFONT, f.0 as usize, 1);
 }
 
-unsafe fn make_font(px: i32, weight: i32) -> HFONT {
+unsafe fn make_font(px: i32, weight: i32, face: PCWSTR) -> HFONT {
     CreateFontW(
         -px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, 0, w!("Segoe UI"),
+        CLEARTYPE_QUALITY, 0, face,
     )
 }
 
@@ -202,6 +204,7 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
             hInstance: hinstance,
             lpszClassName: class,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hIcon: crate::load_app_icon(0, 0).unwrap_or_default(),
             ..Default::default()
         };
         RegisterClassW(&wc);
@@ -280,7 +283,7 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
         )?;
 
         let mut cats = Vec::new();
-        for (i, (_, label)) in CATS.iter().enumerate() {
+        for (i, (_, label, _)) in CATS.iter().enumerate() {
             let wl = crate::wide(label);
             let b = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -295,9 +298,11 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
             cats.push(b);
         }
 
-        let font_ui = make_font(sc(15), 400);
-        let font_name = make_font(sc(15), 600);
-        let font_path = make_font(sc(12), 400);
+        let font_ui = make_font(sc(15), 400, w!("Segoe UI"));
+        let font_name = make_font(sc(15), 600, w!("Segoe UI"));
+        let font_path = make_font(sc(12), 400, w!("Segoe UI"));
+        // 分类按钮的小图标用系统内置 Segoe MDL2 Assets（Win10/11 都有）。
+        let font_icon = make_font(sc(15), 400, w!("Segoe MDL2 Assets"));
         set_font(edit, font_ui);
         set_font(combo, font_ui);
         set_font(count, font_path);
@@ -324,6 +329,7 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
                 font_ui,
                 font_name,
                 font_path,
+                font_icon,
                 item_h: sc(46),
                 dpi,
                 combo_w: sc(110),
@@ -691,11 +697,28 @@ unsafe fn draw_cat_button(dis: &DRAWITEMSTRUCT) {
         t.alt_bg
     };
     let fg = if active { 0x00FF_FFFF } else { t.fg };
-    let mut rc = dis.rcItem;
+    let rc = dis.rcItem;
     FillRect(dis.hDC, &rc, theme::solid_brush(bg));
     SetBkMode(dis.hDC, TRANSPARENT);
-    let font = UI.with(|c| c.borrow().as_ref().map(|u| u.font_ui).unwrap());
-    draw_text(dis.hDC, label, &mut rc, fg, font, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    let glyph = CATS.get(idx).map(|c| c.2).unwrap_or("");
+    let (font_ui, font_icon) =
+        UI.with(|c| c.borrow().as_ref().map(|u| (u.font_ui, u.font_icon)).unwrap());
+
+    // 图标(MDL2) + 文字两段绘制，整体水平居中；窄到放不下时降级为只画图标。
+    let gap = sc_dpi(4);
+    let gw = measure_text(font_icon, glyph);
+    let lw = measure_text(font_ui, label);
+    let avail = rc.right - rc.left;
+    if gw + gap + lw <= avail - sc_dpi(8) {
+        let start = rc.left + (avail - (gw + gap + lw)) / 2;
+        let mut gr = RECT { left: start, top: rc.top, right: start + gw, bottom: rc.bottom };
+        draw_text(dis.hDC, glyph, &mut gr, fg, font_icon, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        let mut lr = RECT { left: start + gw + gap, top: rc.top, right: rc.right, bottom: rc.bottom };
+        draw_text(dis.hDC, label, &mut lr, fg, font_ui, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    } else {
+        let mut gr = rc;
+        draw_text(dis.hDC, glyph, &mut gr, fg, font_icon, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    }
 }
 
 // ---- 结果列表（自绘 + 平滑滚动）----

@@ -28,7 +28,6 @@ ss-platform = { path = "crates/ss-platform" }
 ss-core = { path = "crates/ss-core" }
 ss-shell = { path = "crates/ss-shell" }
 ss-config = { path = "crates/ss-config" }
-ss-ui = { path = "crates/ss-ui" }
 
 # 体积/内存优先的 release profile（见计划）
 [profile.release]
