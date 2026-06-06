@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-const RECENT_MAX: usize = 2;
+use serde::{Deserialize, Serialize};
 
 fn config_dir() -> PathBuf {
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
@@ -16,6 +16,9 @@ fn favorites_path() -> PathBuf {
 }
 fn recent_path() -> PathBuf {
     config_dir().join("recent.json")
+}
+fn settings_path() -> PathBuf {
+    config_dir().join("settings.json")
 }
 
 fn load_list(path: &PathBuf) -> Vec<String> {
@@ -79,11 +82,68 @@ pub fn toggle_favorite(path: &str) {
     }
 }
 
-/// 记录一次「最近位置」（去重置顶 + LRU 截断）。
+/// 记录一次「最近位置」（去重置顶 + LRU 截断，上限取自设置）。
 pub fn record_recent(path: &str) {
     let mut r = recent();
     r.retain(|p| !same_path(p, path));
     r.insert(0, path.to_string());
-    r.truncate(RECENT_MAX);
+    r.truncate(load_settings().recent_max);
     save_list(&recent_path(), &r);
+}
+
+// ---- 设置 ----
+
+/// 全局设置（settings.json）。`#[serde(default)]` 保证旧文件缺字段时用默认值。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// 主题：`business_light` | `business_dark` | `acrylic`
+    pub theme: String,
+    /// 索引的盘符（大写）；空 = 全部固定 NTFS 盘
+    pub indexed_drives: Vec<char>,
+    /// 搜索结果上限
+    pub result_limit: usize,
+    /// 浮窗「最近位置」保留条数
+    pub recent_max: usize,
+    /// 开机自启（计划任务）
+    pub autostart: bool,
+    /// 是否启用保存对话框浮窗
+    pub popup_enabled: bool,
+    pub popup_show_favorites: bool,
+    pub popup_show_recent: bool,
+    pub popup_show_open: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            theme: "business_light".into(),
+            indexed_drives: Vec::new(),
+            result_limit: 200,
+            recent_max: 2,
+            autostart: false,
+            popup_enabled: true,
+            popup_show_favorites: true,
+            popup_show_recent: true,
+            popup_show_open: true,
+        }
+    }
+}
+
+pub fn load_settings() -> Settings {
+    match std::fs::read(settings_path()) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => Settings::default(),
+    }
+}
+
+pub fn save_settings(s: &Settings) {
+    let _ = std::fs::create_dir_all(config_dir());
+    if let Ok(json) = serde_json::to_vec_pretty(s) {
+        let p = settings_path();
+        let tmp = p.with_extension("tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &p);
+        }
+    }
 }

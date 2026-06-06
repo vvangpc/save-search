@@ -26,7 +26,7 @@ fn main() {
 
     // 全部盘搜索
     let t2 = Instant::now();
-    let all = cat.search(&query, None, 50);
+    let all = cat.search(&query, None, ss_core::Category::All, 50);
     let _ = writeln!(buf, "\n[全部盘] '{}': {} 命中, {:.2?}", query, all.len(), t2.elapsed());
     for r in all.iter().take(5) {
         let _ = writeln!(buf, "  {}", r.path);
@@ -35,7 +35,7 @@ fn main() {
     // 逐盘过滤搜索
     for d in &letters {
         let t3 = Instant::now();
-        let res = cat.search(&query, Some(*d), 50);
+        let res = cat.search(&query, Some(*d), ss_core::Category::All, 50);
         let _ = writeln!(buf, "\n[仅 {}:] '{}': {} 命中, {:.2?}", d, query, res.len(), t3.elapsed());
         for r in res.iter().take(3) {
             let _ = writeln!(buf, "  {}", r.path);

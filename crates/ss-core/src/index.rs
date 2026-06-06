@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use crate::category::Category;
+
 /// 节点标志位。
 pub const IS_DIR: u16 = 1 << 0;
 /// 已删除（USN 删除事件后置位，搜索时跳过；全量重建时清理）。
@@ -245,7 +247,7 @@ impl Index {
         s
     }
 
-    pub fn search_ids(&self, query: &str, limit: usize) -> Vec<u32> {
+    pub fn search_ids(&self, query: &str, category: Category, limit: usize) -> Vec<u32> {
         let mut out = Vec::new();
         if query.is_empty() {
             return out;
@@ -255,18 +257,23 @@ impl Index {
             if self.is_deleted(id) {
                 continue;
             }
-            if contains_ci(self.name_bytes(id), &q) {
-                out.push(id);
-                if out.len() >= limit {
-                    break;
-                }
+            let nb = self.name_bytes(id);
+            if !contains_ci(nb, &q) {
+                continue;
+            }
+            if !crate::category::matches(category, nb, self.is_dir(id)) {
+                continue;
+            }
+            out.push(id);
+            if out.len() >= limit {
+                break;
             }
         }
         out
     }
 
-    pub fn search(&self, query: &str, limit: usize) -> Vec<SearchResult> {
-        self.search_ids(query, limit)
+    pub fn search(&self, query: &str, category: Category, limit: usize) -> Vec<SearchResult> {
+        self.search_ids(query, category, limit)
             .into_iter()
             .map(|id| SearchResult {
                 name: self.name(id),
@@ -350,10 +357,16 @@ mod tests {
         b.push(200, 100, 0, "report.txt");
         let mut idx = b.finish();
 
-        let r = idx.search("report", 10);
+        let r = idx.search("report", Category::All, 10);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].path, "C:\\Users\\report.txt");
-        assert_eq!(idx.search("USERS", 10).len(), 1);
+        assert_eq!(idx.search("USERS", Category::All, 10).len(), 1);
+
+        // 分类过滤：report.txt 是文档，不是图片/文件夹
+        assert_eq!(idx.search("report", Category::Document, 10).len(), 1);
+        assert_eq!(idx.search("report", Category::Image, 10).len(), 0);
+        assert_eq!(idx.search("Users", Category::Folder, 10).len(), 1);
+        assert_eq!(idx.search("Users", Category::Document, 10).len(), 0);
 
         // 增量：新增文件、删除文件
         idx.apply(&Change::Upsert {
@@ -362,10 +375,10 @@ mod tests {
             attrs: 0,
             name: "notes.md".into(),
         });
-        assert_eq!(idx.search("notes", 10)[0].path, "C:\\Users\\notes.md");
+        assert_eq!(idx.search("notes", Category::All, 10)[0].path, "C:\\Users\\notes.md");
 
         idx.apply(&Change::Delete { frn: 200 });
-        assert_eq!(idx.search("report", 10).len(), 0);
+        assert_eq!(idx.search("report", Category::All, 10).len(), 0);
 
         // 重命名（同 frn upsert 新名字）
         idx.apply(&Change::Upsert {
@@ -374,7 +387,7 @@ mod tests {
             attrs: 0,
             name: "todo.md".into(),
         });
-        assert_eq!(idx.search("notes", 10).len(), 0);
-        assert_eq!(idx.search("todo", 10).len(), 1);
+        assert_eq!(idx.search("notes", Category::All, 10).len(), 0);
+        assert_eq!(idx.search("todo", Category::All, 10).len(), 1);
     }
 }

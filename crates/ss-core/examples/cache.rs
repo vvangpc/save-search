@@ -30,7 +30,7 @@ fn main() {
     std::thread::sleep(Duration::from_millis(600));
 
     let n1 = cat.catch_up();
-    let found1 = cat.search(marker, None, 10);
+    let found1 = cat.search(marker, None, ss_core::Category::All, 10);
     let _ = writeln!(buf, "catch_up 应用 {n1} 变更; 搜到 {} 个 (期望≥1)", found1.len());
     for r in &found1 {
         let _ = writeln!(buf, "  {}", r.path);
@@ -39,7 +39,7 @@ fn main() {
     let _ = std::fs::remove_file(&p);
     std::thread::sleep(Duration::from_millis(600));
     let n2 = cat.catch_up();
-    let found2 = cat.search(marker, None, 10);
+    let found2 = cat.search(marker, None, ss_core::Category::All, 10);
     let _ = writeln!(buf, "删除后 catch_up 应用 {n2} 变更; 搜到 {} 个 (期望0)", found2.len());
 
     cat.save_all(cache);

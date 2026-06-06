@@ -39,7 +39,7 @@ fn run(letter: char, query: &str, buf: &mut String) -> i32 {
             );
 
             let t2 = Instant::now();
-            let res = idx.search(query, 100);
+            let res = idx.search(query, ss_core::Category::All, 100);
             let search = t2.elapsed();
             let _ = writeln!(buf, "搜索 '{}': {} 个命中, 耗时 {:.2?}", query, res.len(), search);
             for r in res.iter().take(15) {

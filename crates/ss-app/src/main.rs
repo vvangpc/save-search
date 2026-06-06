@@ -6,7 +6,11 @@
 #![windows_subsystem = "windows"]
 
 mod dlgpopup;
+mod icons;
+mod paint;
 mod searchwin;
+mod settings_win;
+mod theme;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -34,6 +38,8 @@ const WM_TRAY_CALLBACK: u32 = WM_APP + 1;
 const TRAY_UID: u32 = 1;
 /// 菜单项：打开搜索。
 const IDM_OPEN: u32 = 40002;
+/// 菜单项：设置。
+const IDM_SETTINGS: u32 = 40003;
 /// 菜单项：退出。
 const IDM_EXIT: u32 = 40001;
 
@@ -88,8 +94,10 @@ unsafe fn show_context_menu(hwnd: HWND) {
         return;
     };
     let open_text = wide("打开搜索\tAlt+Space");
+    let set_text = wide("设置…");
     let exit_text = wide("退出 SaveSearch");
     let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN as usize, PCWSTR(open_text.as_ptr()));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_SETTINGS as usize, PCWSTR(set_text.as_ptr()));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, PCWSTR(exit_text.as_ptr()));
     let _ = SetMenuDefaultItem(menu, IDM_OPEN, 0);
@@ -129,6 +137,7 @@ unsafe extern "system" fn wndproc(
         WM_COMMAND => {
             match lo_word(wparam.0 as u32) {
                 IDM_OPEN => searchwin::toggle(),
+                IDM_SETTINGS => settings_win::open(),
                 IDM_EXIT => {
                     let _ = DestroyWindow(hwnd);
                 }
@@ -159,6 +168,10 @@ fn main() -> windows::core::Result<()> {
 
         // COM STA（IShellWindows 枚举 / UI Automation 导航需要）
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        // 读取设置并应用主题
+        let settings = ss_config::load_settings();
+        theme::set_current(theme::theme_by_name(&settings.theme));
 
         let hmodule = GetModuleHandleW(None)?;
         let hinstance = HINSTANCE(hmodule.0);
@@ -204,9 +217,10 @@ fn main() -> windows::core::Result<()> {
         {
             let catalog2 = catalog.clone();
             let cache2 = cache_dir.clone();
+            let drives = settings.indexed_drives.clone();
             let hwnd_raw = search_hwnd.0 as isize;
             std::thread::spawn(move || {
-                let cat = ss_core::Catalog::build_or_load(&cache2);
+                let cat = ss_core::Catalog::build_or_load(&cache2, &drives);
                 *catalog2.write() = Some(cat);
                 let h = HWND(hwnd_raw as *mut core::ffi::c_void);
                 let _ = PostMessageW(Some(h), searchwin::WM_APP_INDEX_READY, WPARAM(0), LPARAM(0));
@@ -232,6 +246,16 @@ fn main() -> windows::core::Result<()> {
         let _ = SetWinEventHook(
             EVENT_OBJECT_DESTROY,
             EVENT_OBJECT_LOCATIONCHANGE,
+            None,
+            Some(win_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
+        // 前台变化：对话框失焦时隐藏浮窗
+        let _ = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
             None,
             Some(win_event_proc),
             0,
@@ -283,13 +307,16 @@ unsafe extern "system" fn win_event_proc(
     }
     match event {
         EVENT_OBJECT_SHOW => {
-            if ss_shell::is_file_dialog(hwnd) {
+            if ss_shell::is_file_dialog(hwnd) && ss_config::load_settings().popup_enabled {
                 let entries = build_popup_entries();
                 dlgpopup::show_for(hwnd, entries);
             }
         }
         EVENT_OBJECT_LOCATIONCHANGE => {
             dlgpopup::on_dialog_moved(hwnd);
+        }
+        EVENT_SYSTEM_FOREGROUND => {
+            dlgpopup::on_foreground(hwnd);
         }
         EVENT_OBJECT_HIDE | EVENT_OBJECT_DESTROY => {
             if dlgpopup::current_dialog() == Some(hwnd) {
@@ -300,26 +327,33 @@ unsafe extern "system" fn win_event_proc(
     }
 }
 
-/// 组装浮窗条目：收藏 + 已打开资源管理器 + 最近位置（按路径去重）。
-fn build_popup_entries() -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+/// 组装浮窗条目：收藏 + 已打开资源管理器 + 最近位置（按路径去重，遵循设置显示项）。
+fn build_popup_entries() -> Vec<(dlgpopup::EntryKind, String)> {
+    use dlgpopup::EntryKind;
+    let s = ss_config::load_settings();
+    let mut out: Vec<(EntryKind, String)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
-    let add =
-        |disp: String, path: String, out: &mut Vec<(String, String)>, seen: &mut Vec<String>| {
-            if path.is_empty() || seen.iter().any(|s| same_path(s, &path)) {
-                return;
-            }
-            seen.push(path.clone());
-            out.push((disp, path));
-        };
-    for f in ss_config::favorites() {
-        add(format!("★ {f}"), f, &mut out, &mut seen);
+    let mut add = |kind: EntryKind, path: String| {
+        if path.is_empty() || seen.iter().any(|p| same_path(p, &path)) {
+            return;
+        }
+        seen.push(path.clone());
+        out.push((kind, path));
+    };
+    if s.popup_show_favorites {
+        for f in ss_config::favorites() {
+            add(EntryKind::Favorite, f);
+        }
     }
-    for f in ss_shell::enumerate_open_folders() {
-        add(f.clone(), f, &mut out, &mut seen);
+    if s.popup_show_open {
+        for f in ss_shell::enumerate_open_folders() {
+            add(EntryKind::Open, f);
+        }
     }
-    for f in ss_config::recent() {
-        add(format!("最近  {f}"), f, &mut out, &mut seen);
+    if s.popup_show_recent {
+        for f in ss_config::recent() {
+            add(EntryKind::Recent, f);
+        }
     }
     out
 }
@@ -327,6 +361,25 @@ fn build_popup_entries() -> Vec<(String, String)> {
 fn same_path(a: &str, b: &str) -> bool {
     a.trim_end_matches('\\')
         .eq_ignore_ascii_case(b.trim_end_matches('\\'))
+}
+
+/// 开机自启：建/删「最高权限」登录计划任务（免 UAC）。需管理员权限（本程序已提权）。
+pub(crate) fn set_autostart(enable: bool) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut cmd = std::process::Command::new("schtasks");
+    if enable {
+        cmd.args([
+            "/Create", "/F", "/RL", "HIGHEST", "/SC", "ONLOGON", "/TN", "SaveSearch", "/TR", &exe,
+        ]);
+    } else {
+        cmd.args(["/Delete", "/F", "/TN", "SaveSearch"]);
+    }
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let _ = cmd.output();
 }
 
 /// 索引缓存目录：`%LOCALAPPDATA%\SaveSearch\cache`。

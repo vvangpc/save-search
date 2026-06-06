@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::category::Category;
 use crate::drives::ntfs_fixed_drives;
 use crate::index::{Index, SearchResult};
 use crate::mft::{build_index_for_drive, current_usn_state, read_changes};
@@ -30,10 +31,15 @@ impl Catalog {
     }
 
     /// 优先从缓存加载并做 USN 追赶；缓存无效则全量重建并写缓存。
-    pub fn build_or_load(cache_dir: &Path) -> Catalog {
+    /// `only` 非空时只索引其中的盘符（大写）；空 = 全部固定 NTFS 盘。
+    pub fn build_or_load(cache_dir: &Path, only: &[char]) -> Catalog {
         let _ = std::fs::create_dir_all(cache_dir);
+        let only_up: Vec<char> = only.iter().map(|c| c.to_ascii_uppercase()).collect();
         let mut indexes = Vec::new();
         for letter in ntfs_fixed_drives() {
+            if !only_up.is_empty() && !only_up.contains(&letter) {
+                continue;
+            }
             if let Some(idx) = Self::try_load(cache_dir, letter) {
                 indexes.push(idx);
             } else if let Ok(idx) = build_index_for_drive(letter) {
@@ -101,8 +107,14 @@ impl Catalog {
         self.indexes.iter().map(|i| i.memory_bytes()).sum()
     }
 
-    /// 搜索。`drive=None` 搜索全部盘；`Some(letter)` 仅该盘。结果总数不超过 `limit`。
-    pub fn search(&self, query: &str, drive: Option<char>, limit: usize) -> Vec<SearchResult> {
+    /// 搜索。`drive=None` 搜全部盘；`category` 按类型过滤。结果总数不超过 `limit`。
+    pub fn search(
+        &self,
+        query: &str,
+        drive: Option<char>,
+        category: Category,
+        limit: usize,
+    ) -> Vec<SearchResult> {
         let mut out = Vec::new();
         let want = drive.map(|d| d.to_ascii_uppercase());
         for idx in &self.indexes {
@@ -115,7 +127,7 @@ impl Catalog {
             if remaining == 0 {
                 break;
             }
-            out.extend(idx.search(query, remaining));
+            out.extend(idx.search(query, category, remaining));
         }
         out
     }
