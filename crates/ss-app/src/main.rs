@@ -19,9 +19,12 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM,
+};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, VK_SPACE};
 use windows::Win32::UI::HiDpi::{
@@ -189,6 +192,23 @@ unsafe extern "system" fn wndproc(
 
 fn main() -> windows::core::Result<()> {
     unsafe {
+        // 防多开：同一会话只允许一个实例。已有实例则唤起其搜索框后退出。
+        // 句柄绑定到 main 作用域，存活整个进程期间 → Mutex 持续存在作为锁。
+        let _instance_mutex = CreateMutexW(None, false, w!("SaveSearch.SingleInstance.Mutex")).ok();
+        // GetLastError 必须紧跟 CreateMutexW，中间不能插入其他 Win32 调用（.ok() 是纯 Rust）。
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            // 找到已有实例那个隐藏托盘窗口（类名 SaveSearchTrayWnd），让它打开搜索框。
+            if let Ok(existing) = FindWindowW(w!("SaveSearchTrayWnd"), PCWSTR::null()) {
+                let _ = PostMessageW(
+                    Some(existing),
+                    WM_COMMAND,
+                    WPARAM(IDM_OPEN as usize),
+                    LPARAM(0),
+                );
+            }
+            return Ok(());
+        }
+
         // PerMonitorV2 DPI（清单里也声明了，这里兜底）
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
