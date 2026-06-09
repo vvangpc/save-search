@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::category::Category;
 use crate::drives::ntfs_fixed_drives;
-use crate::index::{Index, SearchResult};
+use crate::index::{Index, ScoreKey, SearchResult};
 use crate::mft::{build_index_for_drive, current_usn_state, read_changes};
 use crate::persist;
 
@@ -140,20 +140,24 @@ impl Catalog {
             return Vec::new();
         }
 
-        let mut out = Vec::new();
+        // 多盘：各盘收集已排序候选 → 全局排序 → 取前 limit → 仅前 limit 还原字符串。
         let want = drive.map(|d| d.to_ascii_uppercase());
-        for idx in &self.indexes {
+        let mut merged: Vec<(ScoreKey, usize, u32)> = Vec::new();
+        for (di, idx) in self.indexes.iter().enumerate() {
             if let Some(d) = want {
                 if idx.drive_letter() != d {
                     continue;
                 }
             }
-            let remaining = limit.saturating_sub(out.len());
-            if remaining == 0 {
-                break;
+            for (k, id) in idx.collect_sorted(query, category, None, limit) {
+                merged.push((k, di, id));
             }
-            out.extend(idx.search(query, category, remaining));
         }
-        out
+        merged.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        merged.truncate(limit);
+        merged
+            .into_iter()
+            .map(|(_, di, id)| self.indexes[di].materialize(id))
+            .collect()
     }
 }

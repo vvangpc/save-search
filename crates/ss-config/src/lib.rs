@@ -142,6 +142,8 @@ pub struct Settings {
     pub popup_show_favorites: bool,
     pub popup_show_recent: bool,
     pub popup_show_open: bool,
+    /// 上次搜索词（跨重启记忆，启动时预填搜索框）
+    pub last_query: String,
 }
 
 impl Default for Settings {
@@ -157,6 +159,7 @@ impl Default for Settings {
             popup_show_favorites: true,
             popup_show_recent: true,
             popup_show_open: true,
+            last_query: String::new(),
         }
     }
 }
@@ -174,5 +177,19 @@ pub fn save_settings(s: &Settings) {
             #[cfg(debug_assertions)]
             eprintln!("SaveSearch 写入 settings.json 失败: {}", _e);
         }
+    }
+}
+
+/// 读取上次搜索词（跨程序重启）。
+pub fn last_query() -> String {
+    load_settings().last_query
+}
+
+/// 保存上次搜索词；与当前值相同则不写盘（避免无谓 IO）。
+pub fn save_last_query(q: &str) {
+    let mut s = load_settings();
+    if s.last_query != q {
+        s.last_query = q.to_string();
+        save_settings(&s);
     }
 }

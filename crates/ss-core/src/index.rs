@@ -71,6 +71,115 @@ fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
     false
 }
 
+/// 一个查询词：已折叠小写的字节 + 是否含通配符（`*`/`?`）。
+struct CompiledTerm {
+    lower: Vec<u8>,
+    has_wild: bool,
+}
+
+/// 把原始查询编译为词列表：按空白分词，每词预折叠小写并标记是否含通配符。
+/// 空白被 `split_ascii_whitespace` 吃掉，不产生空词；空查询返回空 Vec。
+fn compile_query(query: &str) -> Vec<CompiledTerm> {
+    query
+        .split_ascii_whitespace()
+        .map(|w| {
+            let lower: Vec<u8> = w.bytes().map(|b| b.to_ascii_lowercase()).collect();
+            let has_wild = lower.iter().any(|&b| b == b'*' || b == b'?');
+            CompiledTerm { lower, has_wild }
+        })
+        .collect()
+}
+
+/// 单个词是否命中文件名：无通配=子串匹配（复用 `contains_ci`）；含通配=子串锚定 glob。
+fn term_matches(hay: &[u8], t: &CompiledTerm) -> bool {
+    if t.has_wild {
+        wildcard_contains_ci(hay, &t.lower)
+    } else {
+        contains_ci(hay, &t.lower)
+    }
+}
+
+/// 所有词都命中才算匹配（AND）；任一不命中即短路。
+fn all_terms_match(hay: &[u8], terms: &[CompiledTerm]) -> bool {
+    terms.iter().all(|t| term_matches(hay, t))
+}
+
+/// 子串锚定的通配匹配：`pat` 能在 `hay` 任意起始位匹配即命中。`pat` 须已小写。
+/// `*`=任意多字符（含 0），`?`=任意一字符，其余按 ASCII 折叠大小写比较。
+fn wildcard_contains_ci(hay: &[u8], pat: &[u8]) -> bool {
+    for start in 0..=hay.len() {
+        if glob_at(&hay[start..], pat) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 从 `h` 开头匹配 glob `pat`；`pat` 消费完即成功（尾部自由 = 子串语义）。
+/// 经典「贪心 + 星号回溯」，无递归。
+fn glob_at(h: &[u8], pat: &[u8]) -> bool {
+    let (mut hi, mut pi) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_hi = 0usize;
+    loop {
+        if pi < pat.len() {
+            match pat[pi] {
+                b'*' => {
+                    star_pi = Some(pi);
+                    star_hi = hi;
+                    pi += 1;
+                    continue;
+                }
+                b'?' => {
+                    if hi < h.len() {
+                        hi += 1;
+                        pi += 1;
+                        continue;
+                    }
+                }
+                c => {
+                    if hi < h.len() && h[hi].to_ascii_lowercase() == c {
+                        hi += 1;
+                        pi += 1;
+                        continue;
+                    }
+                }
+            }
+        } else {
+            return true; // pat 用尽即命中（不要求消费完 h）
+        }
+        // 失配：回溯到最近的 '*'，多吞一个字符再试
+        if let Some(sp) = star_pi {
+            star_hi += 1;
+            if star_hi > h.len() {
+                return false;
+            }
+            hi = star_hi;
+            pi = sp + 1;
+        } else {
+            return false;
+        }
+    }
+}
+
+/// 搜索结果排序键。派生 `Ord` 按字段先后、各字段升序比较，`bool` 的 `false < true`，
+/// 故命中项一律用否定语义（`not_*`，命中 = `false` 排在前）。
+/// 顺序：完全匹配 > 前缀匹配 > 目录 > 浅路径 > 名称字母序。
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ScoreKey {
+    not_exact: bool,
+    not_prefix: bool,
+    not_dir: bool,
+    depth: u16,
+    name_lower: Vec<u8>,
+}
+
+/// 候选收集上限：兜底极端泛查询（如单字符），限制内存/CPU。
+const CAND_CAP_MIN: usize = 2000;
+fn cand_cap(limit: usize) -> usize {
+    limit.saturating_mul(20).max(CAND_CAP_MIN)
+}
+
 /// 增量构建器：枚举 MFT 时逐条 `push`，最后 `finish` 得到 `Index`。
 pub struct IndexBuilder {
     names_off: Vec<u32>,
@@ -247,40 +356,129 @@ impl Index {
         s
     }
 
-    pub fn search_ids(&self, query: &str, category: Category, limit: usize) -> Vec<u32> {
-        let mut out = Vec::new();
-        if query.is_empty() {
-            return out;
+    /// 沿父链数层级（不构建路径字符串）。带 4096 步护栏防环。
+    fn depth_of(&self, id: u32) -> u16 {
+        let mut d = 0u16;
+        let mut cur = id;
+        let mut guard = 0;
+        while cur != u32::MAX && cur != ROOT_ID && guard < 4096 {
+            d = d.saturating_add(1);
+            cur = self.parent[cur as usize];
+            guard += 1;
         }
-        let q: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
+        d
+    }
+
+    /// 收集命中候选（仅 id + 打分键，不建路径字符串）。命中数达 `cap` 即停、返回 `truncated=true`。
+    /// `terms` 须非空（由调用方保证）。`ancestor=Some` 时只取该子树后代。
+    fn collect_scored(
+        &self,
+        terms: &[CompiledTerm],
+        category: Category,
+        ancestor: Option<u32>,
+        cap: usize,
+    ) -> (Vec<(ScoreKey, u32)>, bool) {
+        let mut out: Vec<(ScoreKey, u32)> = Vec::new();
+        let mut truncated = false;
+        // 只有「单词且无通配」才可能构成完全/前缀匹配（多词或含通配恒不算）。
+        let single_plain = terms.len() == 1 && !terms[0].has_wild;
         for id in 1..self.names_len.len() as u32 {
             if self.is_deleted(id) {
                 continue;
             }
             let nb = self.name_bytes(id);
-            if !contains_ci(nb, &q) {
+            if !all_terms_match(nb, terms) {
                 continue;
             }
-            if !crate::category::matches(category, nb, self.is_dir(id)) {
+            let is_dir = self.is_dir(id);
+            if !crate::category::matches(category, nb, is_dir) {
                 continue;
             }
-            out.push(id);
-            if out.len() >= limit {
+            if let Some(anc) = ancestor {
+                if !self.is_descendant(id, anc) {
+                    continue;
+                }
+            }
+            let name_lower: Vec<u8> = nb.iter().map(|b| b.to_ascii_lowercase()).collect();
+            let not_exact = !(single_plain && name_lower == terms[0].lower);
+            let not_prefix = if terms[0].has_wild {
+                true
+            } else {
+                !name_lower.starts_with(&terms[0].lower)
+            };
+            out.push((
+                ScoreKey {
+                    not_exact,
+                    not_prefix,
+                    not_dir: !is_dir,
+                    depth: self.depth_of(id),
+                    name_lower,
+                },
+                id,
+            ));
+            if out.len() >= cap {
+                truncated = true;
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "SaveSearch 搜索候选达上限 {}（盘 {}），尾部未排序候选被丢弃",
+                    cap,
+                    self.drive_letter()
+                );
                 break;
             }
         }
-        out
+        (out, truncated)
+    }
+
+    /// 由 id 还原一条搜索结果（建 name/path 字符串）。
+    pub(crate) fn materialize(&self, id: u32) -> SearchResult {
+        SearchResult {
+            name: self.name(id),
+            path: self.path(id),
+            is_dir: self.is_dir(id),
+        }
+    }
+
+    /// 收集 → 按相关性排序 → 取前 `limit` → 仅对前 `limit` 个还原字符串。
+    /// `ancestor=None` 全盘，`Some` 限子树。空查询返回空。
+    pub fn search_scored(
+        &self,
+        query: &str,
+        category: Category,
+        ancestor: Option<u32>,
+        limit: usize,
+    ) -> Vec<SearchResult> {
+        let terms = compile_query(query);
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let (mut c, _) = self.collect_scored(&terms, category, ancestor, cand_cap(limit));
+        c.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        c.truncate(limit);
+        c.into_iter().map(|(_, id)| self.materialize(id)).collect()
+    }
+
+    /// 供多盘合并：返回单盘 cap 内、已排序并截到 `limit` 的 `(键, id)`，不还原字符串。
+    /// 全局 top-limit ⊆ 各盘 top-limit 的并集，故先截可减少合并量。
+    pub(crate) fn collect_sorted(
+        &self,
+        query: &str,
+        category: Category,
+        ancestor: Option<u32>,
+        limit: usize,
+    ) -> Vec<(ScoreKey, u32)> {
+        let terms = compile_query(query);
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let (mut c, _) = self.collect_scored(&terms, category, ancestor, cand_cap(limit));
+        c.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        c.truncate(limit);
+        c
     }
 
     pub fn search(&self, query: &str, category: Category, limit: usize) -> Vec<SearchResult> {
-        self.search_ids(query, category, limit)
-            .into_iter()
-            .map(|id| SearchResult {
-                name: self.name(id),
-                path: self.path(id),
-                is_dir: self.is_dir(id),
-            })
-            .collect()
+        self.search_scored(query, category, None, limit)
     }
 
     /// 节点是否为 `ancestor` 的后代（含自身）。
@@ -327,6 +525,7 @@ impl Index {
     }
 
     /// 只在 `ancestor` 子树内搜索。
+    /// 只在 `ancestor` 子树内搜索（带相关性排序）。
     pub fn search_under(
         &self,
         query: &str,
@@ -334,35 +533,7 @@ impl Index {
         ancestor: u32,
         limit: usize,
     ) -> Vec<SearchResult> {
-        let mut out = Vec::new();
-        if query.is_empty() {
-            return out;
-        }
-        let q: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
-        for id in 1..self.names_len.len() as u32 {
-            if self.is_deleted(id) {
-                continue;
-            }
-            let nb = self.name_bytes(id);
-            if !contains_ci(nb, &q) {
-                continue;
-            }
-            if !crate::category::matches(category, nb, self.is_dir(id)) {
-                continue;
-            }
-            if !self.is_descendant(id, ancestor) {
-                continue;
-            }
-            out.push(SearchResult {
-                name: self.name(id),
-                path: self.path(id),
-                is_dir: self.is_dir(id),
-            });
-            if out.len() >= limit {
-                break;
-            }
-        }
-        out
+        self.search_scored(query, category, Some(ancestor), limit)
     }
 
     // ---- USN 增量 ----
@@ -471,5 +642,63 @@ mod tests {
         });
         assert_eq!(idx.search("notes", Category::All, 10).len(), 0);
         assert_eq!(idx.search("todo", Category::All, 10).len(), 1);
+    }
+
+    #[test]
+    fn tokenize_and_wildcard() {
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, FILE_ATTRIBUTE_DIRECTORY, "Users");
+        b.push(200, 100, 0, "report final.txt");
+        b.push(300, 100, 0, "summary.txt");
+        let idx = b.finish();
+
+        // 空格分词 AND：所有词都要命中
+        assert_eq!(idx.search("report txt", Category::All, 10).len(), 1);
+        assert_eq!(idx.search("report zzz", Category::All, 10).len(), 0);
+        // 大小写不敏感
+        assert_eq!(idx.search("REPORT", Category::All, 10).len(), 1);
+        // 通配符
+        assert_eq!(idx.search("*.txt", Category::All, 10).len(), 2);
+        assert_eq!(idx.search("re?ort*", Category::All, 10).len(), 1);
+        assert_eq!(idx.search("rep*final", Category::All, 10).len(), 1);
+    }
+
+    #[test]
+    fn relevance_sort() {
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, FILE_ATTRIBUTE_DIRECTORY, "deep"); // id1 dir depth1
+        b.push(101, 100, FILE_ATTRIBUTE_DIRECTORY, "sub"); // id2 dir depth2
+        b.push(200, 5, 0, "reporting.txt"); // 前缀匹配，非完全
+        b.push(201, 5, 0, "report"); // 完全匹配，文件，depth1
+        b.push(202, 5, FILE_ATTRIBUTE_DIRECTORY, "report"); // 完全匹配，目录，depth1
+        b.push(203, 101, 0, "report"); // 完全匹配，文件，depth3
+        let idx = b.finish();
+
+        let r = idx.search("report", Category::All, 10);
+        // 完全匹配 + 目录优先 → 排第一
+        assert_eq!(r[0].name, "report");
+        assert!(r[0].is_dir);
+        // 完全匹配文件，浅路径在前
+        assert_eq!(r[1].path, "C:\\report");
+        assert!(!r[1].is_dir);
+        assert_eq!(r[2].path, "C:\\deep\\sub\\report");
+        // 前缀匹配（reporting.txt）排在所有完全匹配之后
+        assert_eq!(r.last().unwrap().name, "reporting.txt");
+    }
+
+    #[test]
+    fn cap_truncates_candidates() {
+        let mut b = IndexBuilder::new(b'C');
+        for i in 0..30u64 {
+            b.push(1000 + i, 5, 0, "x.txt");
+        }
+        let idx = b.finish();
+        let terms = compile_query("x");
+        let (cands, trunc) = idx.collect_scored(&terms, Category::All, None, 10);
+        assert_eq!(cands.len(), 10);
+        assert!(trunc);
+        let (cands2, trunc2) = idx.collect_scored(&terms, Category::All, None, 100);
+        assert_eq!(cands2.len(), 30);
+        assert!(!trunc2);
     }
 }

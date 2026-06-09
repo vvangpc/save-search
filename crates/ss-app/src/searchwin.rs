@@ -343,6 +343,11 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
 
         theme::apply_window(hwnd, &theme::current());
         layout(hwnd);
+        // 跨重启记忆：预填上次搜索词（显示时由 toggle 全选，用户打字即整体覆盖）
+        let last = ss_config::last_query();
+        if !last.is_empty() {
+            set_text(edit, &last);
+        }
         Ok(hwnd)
     }
 }
@@ -520,6 +525,17 @@ fn do_search() {
     }
 }
 
+/// 窗口隐藏时把当前查询词持久化（跨重启记忆）。仅非空才写；`save_last_query` 内部"未变不写盘"。
+fn persist_last_query() {
+    if let Some(edit) = UI.with(|c| c.borrow().as_ref().map(|u| u.edit)) {
+        let q = get_text(edit);
+        let q = q.trim();
+        if !q.is_empty() {
+            ss_config::save_last_query(q);
+        }
+    }
+}
+
 fn open_selected() {
     let (search, sel) = match UI.with(|c| c.borrow().as_ref().map(|u| (u.search_hwnd, u.sel))) {
         Some(t) => t,
@@ -557,6 +573,7 @@ pub fn toggle() {
         };
     unsafe {
         if IsWindowVisible(search).as_bool() {
+            persist_last_query();
             stop_anim(list);
             let _ = ShowWindow(search, SW_HIDE);
         } else {
@@ -605,6 +622,7 @@ pub fn pretranslate(msg: &MSG) -> bool {
     }
     let vk = (msg.wParam.0 as u32) as u16;
     if vk == VK_ESCAPE.0 {
+        persist_last_query();
         unsafe {
             stop_anim(list);
             let _ = ShowWindow(search, SW_HIDE);
@@ -1148,6 +1166,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_CLOSE => {
+            persist_last_query();
             if let Some(list) = UI.with(|c| c.borrow().as_ref().map(|u| u.list)) {
                 stop_anim(list);
             }

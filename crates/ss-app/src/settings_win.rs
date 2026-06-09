@@ -474,6 +474,7 @@ fn apply_and_close() {
             popup_show_favorites: checked(u.fav),
             popup_show_recent: checked(u.recent_show),
             popup_show_open: checked(u.open),
+            last_query: ss_config::last_query(), // 保留已记忆的上次搜索词，设置页不编辑此项
         })
     });
     if let Some(s) = s {
