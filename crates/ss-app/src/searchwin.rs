@@ -53,6 +53,7 @@ const CB_SETCURSEL: u32 = 0x014E;
 const CB_SETDROPPEDWIDTH: u32 = 0x0160;
 const CB_GETLBTEXT: u32 = 0x0148;
 const CB_GETLBTEXTLEN: u32 = 0x0149;
+const CB_SETITEMHEIGHT: u32 = 0x0153;
 
 // (分类, 标签, Segoe MDL2 Assets glyph)。glyph 已在 Win10/11 目视核验。
 const CATS: [(Category, &str, &str); 6] = [
@@ -312,6 +313,12 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
 
         add_combo(combo, "全部盘");
         send(combo, CB_SETCURSEL, 0, 0);
+
+        // 自绘 Combo 的 WM_MEASUREITEM 在控件创建时发出，彼时 UI 尚未初始化、
+        // sc_dpi 取了 96dpi 兜底值，高 DPI 下条目偏矮；这里用真实 DPI 重设
+        //（wParam 0=下拉列表项，-1=顶部选择框）。
+        send(combo, CB_SETITEMHEIGHT, 0, sc(22) as isize);
+        send(combo, CB_SETITEMHEIGHT, -1isize as usize, sc(22) as isize);
 
         UI.with(|c| {
             *c.borrow_mut() = Some(Ui {

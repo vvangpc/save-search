@@ -18,13 +18,17 @@ fn write_vec<T: Copy>(w: &mut impl Write, v: &[T]) -> io::Result<()> {
     w.write_all(bytes)
 }
 
-fn read_vec<T: Copy>(r: &mut impl Read) -> io::Result<Vec<T>> {
+fn bad(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+fn read_vec<T: Copy>(r: &mut impl Read, file_len: u64) -> io::Result<Vec<T>> {
     let mut lenb = [0u8; 8];
     r.read_exact(&mut lenb)?;
     let n = u64::from_le_bytes(lenb) as usize;
-    // 防御性上限：单数组最多 5 亿元素
-    if n > 500_000_000 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "vec too large"));
+    // 防御：声明的字节数不可能超过文件总长，拦住损坏头导致的超大分配
+    if (n as u64).saturating_mul(std::mem::size_of::<T>() as u64) > file_len {
+        return Err(bad("vec too large"));
     }
     let mut v: Vec<T> = Vec::with_capacity(n);
     unsafe {
@@ -72,16 +76,29 @@ pub fn save_index(idx: &Index, path: &Path) -> io::Result<()> {
         w.flush()?;
         w.get_ref().sync_all()?; // fsync：flush 只刷用户缓冲，sync_all 才落盘
     }
-    std::fs::rename(&tmp, path)
+    // rename 遇杀软/索引器瞬时占用做短重试（与 ss-config 的原子写一致）
+    let mut last = None;
+    for i in 0..3u64 {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(20 * (i + 1)));
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Err(last.unwrap())
 }
 
 pub fn load_index(path: &Path) -> io::Result<Index> {
     let f = File::open(path)?;
+    let file_len = f.metadata()?.len();
     let mut r = BufReader::new(f);
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
+        return Err(bad("bad magic"));
     }
     let mut one = [0u8; 1];
     r.read_exact(&mut one)?;
@@ -89,13 +106,39 @@ pub fn load_index(path: &Path) -> io::Result<Index> {
     let volume_serial = read_u64(&mut r)?;
     let usn_journal_id = read_u64(&mut r)?;
     let next_usn = read_i64(&mut r)?;
-    let names_off: Vec<u32> = read_vec(&mut r)?;
-    let names_len: Vec<u16> = read_vec(&mut r)?;
-    let parent: Vec<u32> = read_vec(&mut r)?;
-    let flags: Vec<u16> = read_vec(&mut r)?;
-    let name_pool: Vec<u8> = read_vec(&mut r)?;
-    let frns: Vec<u64> = read_vec(&mut r)?;
-    let ids: Vec<u32> = read_vec(&mut r)?;
+    let names_off: Vec<u32> = read_vec(&mut r, file_len)?;
+    let names_len: Vec<u16> = read_vec(&mut r, file_len)?;
+    let parent: Vec<u32> = read_vec(&mut r, file_len)?;
+    let flags: Vec<u16> = read_vec(&mut r, file_len)?;
+    let name_pool: Vec<u8> = read_vec(&mut r, file_len)?;
+    let frns: Vec<u64> = read_vec(&mut r, file_len)?;
+    let ids: Vec<u32> = read_vec(&mut r, file_len)?;
+
+    // 一致性校验：截断/位翻转的缓存若不在此拦截，越界下标会在搜索时 panic
+    //（release 为 panic=abort，整个进程直接退出）。校验失败按坏缓存处理 → 全量重建。
+    let n = names_off.len();
+    if n == 0
+        || n > u32::MAX as usize
+        || names_len.len() != n
+        || parent.len() != n
+        || flags.len() != n
+        || frns.len() != ids.len()
+    {
+        return Err(bad("inconsistent array lengths"));
+    }
+    let pool = name_pool.len();
+    for i in 0..n {
+        if names_off[i] as usize + names_len[i] as usize > pool {
+            return Err(bad("name range out of pool"));
+        }
+        let p = parent[i];
+        if p != u32::MAX && p as usize >= n {
+            return Err(bad("parent out of range"));
+        }
+    }
+    if ids.iter().any(|&id| id as usize >= n) {
+        return Err(bad("frn id out of range"));
+    }
 
     let mut frn_to_id = HashMap::with_capacity(frns.len());
     for (k, v) in frns.into_iter().zip(ids) {

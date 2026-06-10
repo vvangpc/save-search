@@ -180,8 +180,8 @@ pub fn read_changes(
         if end > 8 {
             parse_records(&out, end, &mut changes);
         }
-        if next == start {
-            break; // 无进展
+        if next <= start {
+            break; // 无进展（USN 单调递增，<= 即停，防异常数据死循环）
         }
         start = next;
         if end <= 8 {

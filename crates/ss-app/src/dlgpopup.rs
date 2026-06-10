@@ -30,6 +30,7 @@ pub enum EntryKind {
 const LIST_ID: u32 = 201;
 const LBN_SELCHANGE: u32 = 1;
 const IDM_FAV: u32 = 1;
+const LB_SETITEMHEIGHT: u32 = 0x01A0;
 
 mod st {
     pub const WS_POPUP: u32 = 0x8000_0000;
@@ -142,6 +143,10 @@ pub fn init() -> windows::core::Result<()> {
                 dpi,
             });
         });
+        // LBS_OWNERDRAWFIXED 的 WM_MEASUREITEM 在控件创建时发出，彼时 POPUP 尚未
+        // 初始化、行高取了 96dpi 兜底值 40，高 DPI 下与 reposition 的窗口尺寸计算
+        // 不一致（条目偏矮、底部留白）；这里用真实 DPI 重设。
+        send(list, LB_SETITEMHEIGHT, 0, (dpi * 40 / 96) as isize);
         Ok(())
     }
 }
@@ -298,6 +303,8 @@ unsafe fn show_context_menu(popup_hwnd: HWND, x: i32, y: i32) {
         popup_hwnd,
         None,
     );
+    // KB135788：NOACTIVATE 浮窗上的弹出菜单需事后 Post 一条消息，否则下次点击外部不收起
+    let _ = PostMessageW(Some(popup_hwnd), WM_NULL, WPARAM(0), LPARAM(0));
     let _ = DestroyMenu(menu);
     if cmd.0 == IDM_FAV as i32 {
         ss_config::toggle_favorite(&path);

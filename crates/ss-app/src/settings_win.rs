@@ -8,8 +8,8 @@ use std::ffi::c_void;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, FillRect, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    DEFAULT_CHARSET, HDC, HFONT, OUT_DEFAULT_PRECIS, TRANSPARENT,
+    CreateFontW, DeleteObject, FillRect, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -544,7 +544,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_DESTROY => {
-            SUI.with(|c| *c.borrow_mut() = None);
+            // 回收窗口字体：每次打开设置都会新建一只 HFONT，不删会泄漏 GDI 句柄
+            if let Some(u) = SUI.with(|c| c.borrow_mut().take()) {
+                let _ = DeleteObject(HGDIOBJ(u.font.0));
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),

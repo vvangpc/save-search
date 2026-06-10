@@ -14,7 +14,7 @@ mod theme;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -48,6 +48,19 @@ const IDM_EXIT: u32 = 40001;
 
 /// "TaskbarCreated" 注册消息 id（资源管理器重启后需重建托盘图标）。
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+
+/// 全局目录/缓存目录句柄：供 wndproc 在关机/注销（WM_QUERYENDSESSION）时抢救性保存索引。
+static CATALOG: OnceLock<searchwin::SharedCatalog> = OnceLock::new();
+static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// 保存索引缓存（正常退出与会话结束共用）。
+fn save_catalog_cache() {
+    if let (Some(cat), Some(dir)) = (CATALOG.get(), CACHE_DIR.get()) {
+        if let Some(c) = cat.read().as_ref() {
+            c.save_all(dir);
+        }
+    }
+}
 
 fn lo_word(x: u32) -> u32 {
     x & 0xFFFF
@@ -144,6 +157,8 @@ unsafe fn show_context_menu(hwnd: HWND) {
         hwnd,
         None,
     );
+    // KB135788：隐藏窗口上的弹出菜单需要事后 Post 一条消息，否则下次点击外部不收起
+    let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
     let _ = DestroyMenu(menu);
 }
 
@@ -173,6 +188,11 @@ unsafe extern "system" fn wndproc(
                 _ => {}
             }
             LRESULT(0)
+        }
+        WM_QUERYENDSESSION => {
+            // 关机/注销不会走消息循环的正常退出路径，这里抢救性保存索引缓存
+            save_catalog_cache();
+            LRESULT(1) // 允许会话结束
         }
         WM_DESTROY => {
             remove_tray(hwnd);
@@ -259,6 +279,8 @@ fn main() -> windows::core::Result<()> {
 
         // 先创建搜索窗（隐藏），再后台「读缓存/全量构建」；建完 PostMessage 回填盘符下拉
         let catalog: searchwin::SharedCatalog = Arc::new(RwLock::new(None));
+        let _ = CATALOG.set(catalog.clone());
+        let _ = CACHE_DIR.set(cache_dir.clone());
         let search_hwnd = searchwin::init(catalog.clone())?;
         {
             let catalog2 = catalog.clone();
@@ -273,13 +295,26 @@ fn main() -> windows::core::Result<()> {
             });
         }
 
-        // 后台定时增量（每 2 秒读 USN 日志，文件增删改几秒内反映）
+        // 后台定时增量（每 2 秒读 USN 日志，文件增删改几秒内反映）。
+        // 读日志的磁盘 I/O 在锁外做，只在应用变更的瞬间短暂持写锁——
+        // 否则 I/O 慢时写锁长占，UI 线程每个按键的搜索（读锁）会被卡住。
         {
             let catalog3 = catalog.clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_secs(2));
-                if let Some(c) = catalog3.write().as_mut() {
-                    c.catch_up();
+                let positions = match catalog3.read().as_ref() {
+                    Some(c) => c.usn_positions(),
+                    None => continue,
+                };
+                for (letter, jid, from) in positions {
+                    if let Ok((changes, new_next)) = ss_core::read_changes(letter, jid, from) {
+                        if changes.is_empty() && new_next == from {
+                            continue;
+                        }
+                        if let Some(c) = catalog3.write().as_mut() {
+                            c.apply_drive_changes(letter, &changes, new_next);
+                        }
+                    }
                 }
             });
         }
@@ -327,12 +362,7 @@ fn main() -> windows::core::Result<()> {
         }
 
         // 退出前保存索引缓存（下次秒开）
-        {
-            let guard = catalog.read();
-            if let Some(c) = guard.as_ref() {
-                c.save_all(&cache_dir);
-            }
-        }
+        save_catalog_cache();
     }
     Ok(())
 }
@@ -418,10 +448,13 @@ pub(crate) fn set_autostart(enable: bool) {
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
+    // /TR 的值需内嵌引号：否则 exe 路径含空格时，任务动作会在首个空格处被截断
+    let exe_quoted = format!("\"{exe}\"");
     let mut cmd = std::process::Command::new("schtasks");
     if enable {
         cmd.args([
-            "/Create", "/F", "/RL", "HIGHEST", "/SC", "ONLOGON", "/TN", "SaveSearch", "/TR", &exe,
+            "/Create", "/F", "/RL", "HIGHEST", "/SC", "ONLOGON", "/TN", "SaveSearch", "/TR",
+            &exe_quoted,
         ]);
     } else {
         cmd.args(["/Delete", "/F", "/TN", "SaveSearch"]);

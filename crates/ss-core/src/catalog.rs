@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::category::Category;
 use crate::drives::ntfs_fixed_drives;
-use crate::index::{Index, ScoreKey, SearchResult};
+use crate::index::{Change, Index, ScoreKey, SearchResult};
 use crate::mft::{build_index_for_drive, current_usn_state, read_changes};
 use crate::persist;
 
@@ -69,6 +69,29 @@ impl Catalog {
             idx.set_next_usn(new_next);
         }
         Some(idx)
+    }
+
+    /// 各盘当前 USN 读取位置：(盘符, 日志ID, 起始USN)。
+    /// 供调用方在锁外做 `read_changes` 磁盘 I/O，再用 [`apply_drive_changes`] 短暂持锁应用，
+    /// 避免共享锁在 I/O 期间被长占（卡 UI 搜索）。
+    pub fn usn_positions(&self) -> Vec<(char, u64, i64)> {
+        self.indexes
+            .iter()
+            .map(|i| (i.drive_letter(), i.usn_journal_id(), i.next_usn()))
+            .collect()
+    }
+
+    /// 应用某盘的一批增量变更并推进该盘 USN 位点。盘符不存在时忽略。
+    pub fn apply_drive_changes(&mut self, letter: char, changes: &[Change], new_next: i64) {
+        for idx in &mut self.indexes {
+            if idx.drive_letter() == letter {
+                if !changes.is_empty() {
+                    idx.apply_all(changes);
+                }
+                idx.set_next_usn(new_next);
+                return;
+            }
+        }
     }
 
     /// 增量追赶（供定时器周期调用），返回本次应用的变更总数。
