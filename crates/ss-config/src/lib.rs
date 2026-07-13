@@ -5,6 +5,8 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -24,10 +26,35 @@ fn settings_path() -> PathBuf {
     config_dir().join("settings.json")
 }
 
+/// 解析失败时把损坏文件改名保留（如 favorites.json → favorites.json.corrupt-<unix秒>），
+/// 防止后续 save_* 以「默认值 + 新项」覆盖写回、永久抹掉用户数据。
+/// rename 失败则放弃（文件仍在，下次启动再试）。隔离文件不自动清理（损坏罕见，量极小）。
+fn quarantine_corrupt(path: &Path) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // with_extension 会把 ".json" 换成新扩展名 → "favorites.json.corrupt-1752..."
+    let mut dst = path.with_extension(format!("json.corrupt-{ts}"));
+    for i in 1..10 {
+        if !dst.exists() {
+            break;
+        }
+        dst = path.with_extension(format!("json.corrupt-{ts}-{i}"));
+    }
+    let _ = fs::rename(path, &dst);
+}
+
 fn load_list(path: &PathBuf) -> Vec<String> {
     match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice::<Vec<String>>(&bytes).unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(bytes) => match serde_json::from_slice::<Vec<String>>(&bytes) {
+            Ok(v) => v,
+            Err(_) => {
+                quarantine_corrupt(path);
+                Vec::new()
+            }
+        },
+        Err(_) => Vec::new(), // 文件不存在等：按空列表处理
     }
 }
 
@@ -38,23 +65,33 @@ fn atomic_write_json(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tmp");
+    // tmp 名带进程 id + 序号：防「旧进程正退出、新进程已启动」窗口期的跨进程互踩，
+    // 以及同进程理论上的重入。崩溃残留的孤儿 tmp 量极小，不做清理。
+    static TMP_SEQ: AtomicU32 = AtomicU32::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     {
         let mut f = File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?; // fsync：内容落盘后再 rename，防崩溃留下空/半截文件
     } // 关闭句柄后再 rename（Windows 上源句柄未关会触发共享冲突）
+    let mut last: Option<io::Error> = None;
     for i in 0..3 {
         match fs::rename(&tmp, path) {
             Ok(()) => return Ok(()),
-            Err(e) if i == 2 => {
-                let _ = fs::remove_file(&tmp);
-                return Err(e);
+            Err(e) => {
+                last = Some(e);
+                if i < 2 {
+                    std::thread::sleep(Duration::from_millis(20 * (i + 1)));
+                }
             }
-            Err(_) => std::thread::sleep(Duration::from_millis(20 * (i + 1))),
         }
     }
-    unreachable!()
+    let _ = fs::remove_file(&tmp);
+    Err(last.unwrap_or_else(|| io::Error::other("rename failed")))
 }
 
 fn save_list(path: &PathBuf, list: &[String]) {
@@ -164,14 +201,40 @@ impl Default for Settings {
     }
 }
 
-pub fn load_settings() -> Settings {
-    match std::fs::read(settings_path()) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+/// 进程内 Settings 缓存：热路径（每次击键 / 每次对话框出现 / 每次导航）不再读盘。
+/// 代价：运行期外部手改 settings.json 不生效（设置页是唯一预期编辑入口）。
+static SETTINGS_CACHE: OnceLock<RwLock<Settings>> = OnceLock::new();
+
+/// 真正读盘 + 解析（含损坏隔离）。仅缓存首次初始化时调用。
+fn load_settings_from_disk() -> Settings {
+    let path = settings_path();
+    match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                quarantine_corrupt(&path);
+                Settings::default()
+            }
+        },
         Err(_) => Settings::default(),
     }
 }
 
+fn settings_cache() -> &'static RwLock<Settings> {
+    SETTINGS_CACHE.get_or_init(|| RwLock::new(load_settings_from_disk()))
+}
+
+pub fn load_settings() -> Settings {
+    // release 为 panic=abort，锁毒化实际不可达；仍兜底以保 debug 健壮
+    settings_cache()
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
 pub fn save_settings(s: &Settings) {
+    // 先更新缓存：即使写盘失败，内存值也是进程内真相（设置页改完立即全局可见）
+    *settings_cache().write().unwrap_or_else(|p| p.into_inner()) = s.clone();
     if let Ok(json) = serde_json::to_vec_pretty(s) {
         if let Err(_e) = atomic_write_json(&settings_path(), &json) {
             #[cfg(debug_assertions)]
@@ -191,5 +254,63 @@ pub fn save_last_query(q: &str) {
     if s.last_query != q {
         s.last_query = q.to_string();
         save_settings(&s);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir()
+            .join("ss-config-tests")
+            .join(format!("{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn load_list_corrupt_is_quarantined() {
+        let dir = temp_dir("corrupt");
+        let p = dir.join("favorites.json");
+        fs::write(&p, b"{invalid json").unwrap();
+        assert_eq!(load_list(&p), Vec::<String>::new());
+        // 原文件已被改名隔离，而非留在原地等着被覆盖
+        assert!(!p.exists());
+        let quarantined = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("corrupt-"));
+        assert!(quarantined);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_list_missing_and_valid() {
+        let dir = temp_dir("valid");
+        let p = dir.join("list.json");
+        assert_eq!(load_list(&p), Vec::<String>::new()); // 不存在：空且不产生隔离文件
+        fs::write(&p, br#"["C:\\a", "D:\\b"]"#).unwrap();
+        assert_eq!(load_list(&p), vec!["C:\\a".to_string(), "D:\\b".to_string()]);
+        assert!(p.exists()); // 合法文件不被动
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_roundtrip() {
+        let dir = temp_dir("atomic");
+        let p = dir.join("out.json");
+        atomic_write_json(&p, br#"["x"]"#).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), br#"["x"]"#);
+        // 覆盖写也成功，且无 tmp 残留
+        atomic_write_json(&p, br#"["y"]"#).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), br#"["y"]"#);
+        let tmp_left = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp."));
+        assert!(!tmp_left);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
