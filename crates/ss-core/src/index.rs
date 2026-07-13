@@ -260,6 +260,7 @@ impl IndexBuilder {
             volume_serial: 0,
             usn_journal_id: 0,
             next_usn: 0,
+            tombstones: 0,
         }
     }
 }
@@ -276,6 +277,9 @@ pub struct Index {
     pub(crate) volume_serial: u64,
     pub(crate) usn_journal_id: u64,
     pub(crate) next_usn: i64,
+    /// 墓碑数：被 USN Delete 置 IS_DELETED 但仍占据 SoA 数组的节点数。
+    /// 不落盘（persist 加载时按 flags 重算）。只增不减，全量重建后归零。
+    pub(crate) tombstones: u32,
 }
 
 impl Index {
@@ -293,6 +297,18 @@ impl Index {
             + self.flags.len() * 2
             + self.name_pool.len()
             + self.frn_to_id.capacity() * (8 + 4)
+    }
+
+    /// 墓碑绝对量下限：低于此值不值得全量重建（重建本身要读整卷 MFT）。
+    pub(crate) const REBUILD_MIN_TOMBSTONES: usize = 100_000;
+
+    /// 墓碑占比过高（> 活跃节点的 25% 且绝对量 > REBUILD_MIN_TOMBSTONES）
+    /// → 建议全量重建回收内存。t > (len - t)/4 ⇔ 5t > len。
+    /// 已知局限：重命名同样向 name_pool 追加旧字节但不产生墓碑，
+    /// 不计入本阈值；全量重建会一并回收。
+    pub fn needs_rebuild(&self) -> bool {
+        let t = self.tombstones as usize;
+        t > Self::REBUILD_MIN_TOMBSTONES && t.saturating_mul(5) > self.len()
     }
 
     pub fn drive_letter(&self) -> char {
@@ -555,6 +571,9 @@ impl Index {
         match change {
             Change::Delete { frn } => {
                 if let Some(&id) = self.frn_to_id.get(frn) {
+                    if self.flags[id as usize] & IS_DELETED == 0 {
+                        self.tombstones += 1; // 仅首次置位计数，重复 Delete 不重计
+                    }
                     self.flags[id as usize] |= IS_DELETED;
                     self.frn_to_id.remove(frn);
                 }
@@ -684,6 +703,54 @@ mod tests {
         assert_eq!(r[2].path, "C:\\deep\\sub\\report");
         // 前缀匹配（reporting.txt）排在所有完全匹配之后
         assert_eq!(r.last().unwrap().name, "reporting.txt");
+    }
+
+    #[test]
+    fn tombstone_counting() {
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, FILE_ATTRIBUTE_DIRECTORY, "Users");
+        b.push(200, 100, 0, "a.txt");
+        b.push(300, 100, 0, "b.txt");
+        let mut idx = b.finish();
+        assert_eq!(idx.tombstones, 0);
+
+        idx.apply(&Change::Delete { frn: 200 });
+        assert_eq!(idx.tombstones, 1);
+        // 重复 Delete（frn 已移出 map）不重计
+        idx.apply(&Change::Delete { frn: 200 });
+        assert_eq!(idx.tombstones, 1);
+        // 不存在的 frn 不计
+        idx.apply(&Change::Delete { frn: 999 });
+        assert_eq!(idx.tombstones, 1);
+
+        idx.apply(&Change::Delete { frn: 300 });
+        assert_eq!(idx.tombstones, 2);
+
+        // 同路径「重建」走新增分支，墓碑保持
+        idx.apply(&Change::Upsert {
+            frn: 301,
+            parent_frn: 100,
+            attrs: 0,
+            name: "b.txt".into(),
+        });
+        assert_eq!(idx.tombstones, 2);
+    }
+
+    #[test]
+    fn needs_rebuild_threshold() {
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, 0, "a");
+        let mut idx = b.finish();
+        // 比例满足（墓碑 1 : 总 2）但绝对量远低于下限 → 不重建
+        idx.apply(&Change::Delete { frn: 100 });
+        assert!(!idx.needs_rebuild());
+        // 人为满足绝对量但比例不足 → 不重建；两者都满足 → 重建
+        idx.tombstones = Index::REBUILD_MIN_TOMBSTONES as u32 + 1;
+        assert!(idx.needs_rebuild()); // len=2，5t > len 必然成立
+        // 构造比例不足：t*5 <= len
+        let t = idx.tombstones as usize;
+        idx.names_len.resize(t * 5 + 1, 0);
+        assert!(!idx.needs_rebuild());
     }
 
     #[test]

@@ -112,6 +112,28 @@ impl Catalog {
         total
     }
 
+    /// 墓碑超阈值、建议全量重建的盘符列表（供 USN 轮询线程在读锁下快速查询）。
+    pub fn drives_needing_rebuild(&self) -> Vec<char> {
+        self.indexes
+            .iter()
+            .filter(|i| i.needs_rebuild())
+            .map(|i| i.drive_letter())
+            .collect()
+    }
+
+    /// 用新建索引替换同盘符旧索引（盘符不存在则追加）。
+    /// 调用方持写锁；本函数只做换指针，旧索引在写锁内 drop。
+    pub fn replace_index(&mut self, new_idx: Index) {
+        match self
+            .indexes
+            .iter_mut()
+            .find(|i| i.drive_letter() == new_idx.drive_letter())
+        {
+            Some(slot) => *slot = new_idx,
+            None => self.indexes.push(new_idx),
+        }
+    }
+
     /// 保存所有盘索引到缓存。
     pub fn save_all(&self, cache_dir: &Path) {
         let _ = std::fs::create_dir_all(cache_dir);

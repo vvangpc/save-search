@@ -302,19 +302,48 @@ fn main() -> windows::core::Result<()> {
         // 否则 I/O 慢时写锁长占，UI 线程每个按键的搜索（读锁）会被卡住。
         {
             let catalog3 = catalog.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(2));
-                let positions = match catalog3.read().as_ref() {
-                    Some(c) => c.usn_positions(),
-                    None => continue,
-                };
-                for (letter, jid, from) in positions {
-                    if let Ok((changes, new_next)) = ss_core::read_changes(letter, jid, from) {
-                        if changes.is_empty() && new_next == from {
+            std::thread::spawn(move || {
+                use std::collections::HashMap;
+                use std::time::Instant;
+                // 防重建风暴：单盘重建（无论成败）后至少间隔 6 小时再评估
+                let mut last_rebuild: HashMap<char, Instant> = HashMap::new();
+                loop {
+                    std::thread::sleep(Duration::from_secs(2));
+                    let positions = match catalog3.read().as_ref() {
+                        Some(c) => c.usn_positions(),
+                        None => continue,
+                    };
+                    for (letter, jid, from) in positions {
+                        if let Ok((changes, new_next)) = ss_core::read_changes(letter, jid, from) {
+                            if changes.is_empty() && new_next == from {
+                                continue;
+                            }
+                            if let Some(c) = catalog3.write().as_mut() {
+                                c.apply_drive_changes(letter, &changes, new_next);
+                            }
+                        }
+                    }
+
+                    // 墓碑回收：长时程高频增删会让被删节点（墓碑）无限累积，内存只增不减。
+                    // 超阈值（>活跃 25% 且 >10 万）→ 锁外全量重建该盘，短写锁换入。
+                    // 重建期间旧索引照常服务搜索；build_index_for_drive 在枚举前记录
+                    // USN 高水位，换入后位点续追不丢事件。新索引墓碑为 0，不会连环触发。
+                    let need: Vec<char> = match catalog3.read().as_ref() {
+                        Some(c) => c.drives_needing_rebuild(),
+                        None => continue,
+                    };
+                    for letter in need {
+                        if last_rebuild
+                            .get(&letter)
+                            .is_some_and(|t| t.elapsed() < Duration::from_secs(6 * 3600))
+                        {
                             continue;
                         }
-                        if let Some(c) = catalog3.write().as_mut() {
-                            c.apply_drive_changes(letter, &changes, new_next);
+                        last_rebuild.insert(letter, Instant::now());
+                        if let Ok(idx) = ss_core::build_index_for_drive(letter) {
+                            if let Some(c) = catalog3.write().as_mut() {
+                                c.replace_index(idx);
+                            }
                         }
                     }
                 }

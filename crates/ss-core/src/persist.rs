@@ -145,6 +145,12 @@ pub fn load_index(path: &Path) -> io::Result<Index> {
         frn_to_id.insert(k, v);
     }
 
+    // 墓碑计数不落盘（文件格式不变），加载后按 flags 重算（O(n) 位测试，毫秒级）
+    let tombstones = flags
+        .iter()
+        .filter(|f| **f & crate::index::IS_DELETED != 0)
+        .count() as u32;
+
     Ok(Index {
         names_off,
         names_len,
@@ -156,5 +162,32 @@ pub fn load_index(path: &Path) -> io::Result<Index> {
         volume_serial,
         usn_journal_id,
         next_usn,
+        tombstones,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::index::{Change, IndexBuilder};
+
+    #[test]
+    fn roundtrip_recomputes_tombstones() {
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, 0, "a.txt");
+        b.push(200, 5, 0, "b.txt");
+        let mut idx = b.finish();
+        idx.apply(&Change::Delete { frn: 100 });
+        assert_eq!(idx.tombstones, 1);
+
+        let path = std::env::temp_dir().join(format!(
+            "ss-core-persist-test-{}.ssidx",
+            std::process::id()
+        ));
+        super::save_index(&idx, &path).unwrap();
+        let loaded = super::load_index(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.tombstones, 1); // 不落盘，按 flags 重算后一致
+        assert_eq!(loaded.len(), idx.len());
+    }
 }

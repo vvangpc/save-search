@@ -113,10 +113,12 @@ fn parse_records(buf: &[u8], end: usize, changes: &mut Vec<Change>) {
         let name_len = u16::from_le_bytes(rec[56..58].try_into().unwrap()) as usize;
         let name_off = u16::from_le_bytes(rec[58..60].try_into().unwrap()) as usize;
 
-        if !IndexBuilder::is_root_frn(frn) && name_off + name_len <= record_len && name_len > 0 {
+        if !IndexBuilder::is_root_frn(frn) {
             if reason & USN_REASON_FILE_DELETE != 0 {
+                // 删除只需 frn，不做名字有效性门控——否则名字字段异常的删除记录
+                // 被整条跳过，已删文件的陈旧节点仍可被搜到
                 changes.push(Change::Delete { frn });
-            } else {
+            } else if name_len > 0 && name_off + name_len <= record_len {
                 let name_bytes = &rec[name_off..name_off + name_len];
                 let u16s: Vec<u16> = name_bytes
                     .chunks_exact(2)
