@@ -387,6 +387,8 @@ unsafe fn create() -> windows::core::Result<()> {
     y += 96 + 14;
 
     y += 44;
+    // 版本号（与保存/取消同行左侧；编译期取自 workspace 版本）
+    mklabel(concat!("SaveSearch v", env!("CARGO_PKG_VERSION")), 16, y + 8, 200);
     let wl_ok = crate::wide("保存");
     let ok = CreateWindowExW(
         WINDOW_EX_STYLE(0),

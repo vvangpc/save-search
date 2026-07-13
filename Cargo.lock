@@ -230,7 +230,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "ss-app"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "embed-resource",
  "parking_lot",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "ss-config"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "ss-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "memchr",
  "ss-platform",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "ss-platform"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "thiserror",
  "windows",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "ss-shell"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "ss-platform",
  "windows",
