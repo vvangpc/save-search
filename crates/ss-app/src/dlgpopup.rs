@@ -8,9 +8,10 @@ use std::ffi::c_void;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DrawTextW, FillRect, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DRAW_TEXT_FORMAT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, TRANSPARENT,
+    CreateFontW, DrawTextW, FillRect, GetMonitorInfoW, MonitorFromWindow, SelectObject, SetBkMode,
+    SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DRAW_TEXT_FORMAT,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HDC, HFONT,
+    HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -164,18 +165,28 @@ pub fn show_for(dialog: HWND, entries: Vec<(EntryKind, String)>) {
     let Some((hwnd, list)) = popup_handles() else {
         return;
     };
-    send(list, LB_RESETCONTENT, 0, 0);
-    for _ in 0..entries.len() {
-        send(list, LB_ADDSTRING, 0, 0);
-    }
-    POPUP.with(|c| {
-        if let Some(p) = c.borrow_mut().as_mut() {
-            p.dialog = dialog;
-            p.entries = entries;
-        }
+    // 同一对话框且条目未变：跳过重灌列表——保留选中与滚动位置、避免闪烁
+    // （前台来回切换时 FOREGROUND 分支会反复调用本函数，条目多数时候没变）
+    let unchanged = POPUP.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|p| p.dialog == dialog && p.entries == entries)
+            .unwrap_or(false)
     });
-    unsafe {
-        theme::apply_window(hwnd, &theme::current());
+    if !unchanged {
+        send(list, LB_RESETCONTENT, 0, 0);
+        for _ in 0..entries.len() {
+            send(list, LB_ADDSTRING, 0, 0);
+        }
+        POPUP.with(|c| {
+            if let Some(p) = c.borrow_mut().as_mut() {
+                p.dialog = dialog;
+                p.entries = entries;
+            }
+        });
+        unsafe {
+            theme::apply_window(hwnd, &theme::current());
+        }
     }
     reposition(dialog, hwnd, list);
     unsafe {
@@ -194,8 +205,26 @@ fn reposition(dialog: HWND, hwnd: HWND, list: HWND) {
         let w = (r.right - r.left).clamp(sc(300), sc(640));
         let h = (count.min(12) * item_h + sc(6)).clamp(sc(44), sc(420));
         // 相对对话框水平居中
-        let x = r.left + (r.right - r.left - w) / 2;
-        let _ = MoveWindow(hwnd, x, r.bottom + sc(2), w, h, true);
+        let mut x = r.left + (r.right - r.left - w) / 2;
+        let mut y = r.bottom + sc(2);
+        // 钳制到对话框所在显示器的工作区：对话框贴屏底时浮窗改放其上方，
+        // 上方也放不下则贴工作区顶（会盖住对话框上沿，两害取轻）；取失败走原逻辑
+        let hmon = MonitorFromWindow(dialog, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            let wr = mi.rcWork;
+            if y + h > wr.bottom {
+                y = r.top - sc(2) - h;
+            }
+            if y < wr.top {
+                y = wr.top;
+            }
+            x = x.clamp(wr.left, (wr.right - w).max(wr.left));
+        }
+        let _ = MoveWindow(hwnd, x, y, w, h, true);
         let _ = MoveWindow(list, 0, 0, w, h, true);
     }
 }
@@ -342,8 +371,11 @@ unsafe fn draw_item(dis: &DRAWITEMSTRUCT) {
     } else {
         entry_at(dis.itemID as usize)
     };
-    let (fn_name, fn_path) =
-        POPUP.with(|c| c.borrow().as_ref().map(|p| (p.font_name, p.font_path)).unwrap());
+    // 兜底空 HFONT（POPUP 未初始化时 DC 用默认字体退化绘制），与其他绘制站点一致，
+    // 避免 panic=abort 下裸 unwrap 拉死进程
+    let (fn_name, fn_path) = POPUP
+        .with(|c| c.borrow().as_ref().map(|p| (p.font_name, p.font_path)))
+        .unwrap_or((HFONT(std::ptr::null_mut()), HFONT(std::ptr::null_mut())));
 
     crate::paint::buffered(dis.hDC, dis.rcItem, |hdc, rc| unsafe {
         FillRect(hdc, &rc, theme::solid_brush(bg));

@@ -726,8 +726,11 @@ unsafe fn draw_cat_button(dis: &DRAWITEMSTRUCT) {
     FillRect(dis.hDC, &rc, theme::solid_brush(bg));
     SetBkMode(dis.hDC, TRANSPARENT);
     let glyph = CATS.get(idx).map(|c| c.2).unwrap_or("");
-    let (font_ui, font_icon) =
-        UI.with(|c| c.borrow().as_ref().map(|u| (u.font_ui, u.font_icon)).unwrap());
+    // 兜底空 HFONT（UI 未初始化时 DC 用默认字体退化绘制），与 :698/:919 站点一致，
+    // 避免 panic=abort 下裸 unwrap 拉死进程
+    let (font_ui, font_icon) = UI
+        .with(|c| c.borrow().as_ref().map(|u| (u.font_ui, u.font_icon)))
+        .unwrap_or((HFONT(std::ptr::null_mut()), HFONT(std::ptr::null_mut())));
 
     // 图标(MDL2) + 文字两段绘制，整体水平居中；窄到放不下时降级为只画图标。
     let gap = sc_dpi(4);

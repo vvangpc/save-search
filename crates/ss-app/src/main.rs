@@ -26,7 +26,9 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, VK_SPACE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, MOD_ALT, MOD_NOREPEAT, VK_SPACE,
+};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -319,13 +321,25 @@ fn main() -> windows::core::Result<()> {
             });
         }
 
-        // 注册全局热键 Alt+Space
-        let _ = RegisterHotKey(None, 1, MOD_ALT, VK_SPACE.0 as u32);
+        // 注册全局热键 Alt+Space（MOD_NOREPEAT：长按不重复触发 toggle）
+        let _ = RegisterHotKey(None, 1, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32);
 
-        // 功能2：保存/打开对话框浮窗 + WinEvent 钩子（监听对话框出现/移动/关闭）
+        // 功能2：保存/打开对话框浮窗 + WinEvent 钩子（监听对话框出现/移动/关闭）。
+        // 钩子范围收窄成两段：0x8001(DESTROY)-0x8003(HIDE) 含 SHOW=0x8002，
+        // 加单独的 0x800B(LOCATIONCHANGE)——避开中间 0x8004-0x800A 的
+        // FOCUS/SELECTION/STATECHANGE 全系统高频事件反复唤醒主线程。
         let _ = dlgpopup::init();
         let _ = SetWinEventHook(
             EVENT_OBJECT_DESTROY,
+            EVENT_OBJECT_HIDE,
+            None,
+            Some(win_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
+        let _ = SetWinEventHook(
+            EVENT_OBJECT_LOCATIONCHANGE,
             EVENT_OBJECT_LOCATIONCHANGE,
             None,
             Some(win_event_proc),
@@ -392,7 +406,21 @@ unsafe extern "system" fn win_event_proc(
             dlgpopup::on_dialog_moved(hwnd);
         }
         EVENT_SYSTEM_FOREGROUND => {
-            dlgpopup::on_foreground(hwnd);
+            // 对话框重新回到前台：重新枚举条目——用户可能在切走期间
+            // 新开/关闭了资源管理器文件夹（见 build_popup_entries）。
+            // 自进程窗口（浮窗）的 FOREGROUND 已被 WINEVENT_SKIPOWNPROCESS 过滤，
+            // 右键菜单 SetForegroundWindow(popup) 不会进到这里。
+            if dlgpopup::current_dialog() == Some(hwnd) {
+                // 复核仍是文件对话框：HWND 可能已被系统回收复用给无关窗口
+                if ss_shell::is_file_dialog(hwnd) {
+                    let entries = build_popup_entries();
+                    dlgpopup::show_for(hwnd, entries);
+                } else {
+                    dlgpopup::hide();
+                }
+            } else {
+                dlgpopup::on_foreground(hwnd);
+            }
         }
         EVENT_OBJECT_HIDE | EVENT_OBJECT_DESTROY => {
             if dlgpopup::current_dialog() == Some(hwnd) {
