@@ -9,12 +9,38 @@ use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Subtree,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GetClassNameW, PostMessageW, SendMessageW, WM_CHAR, WM_KEYDOWN, WM_KEYUP,
+    EnumChildWindows, GetClassNameW, PostMessageW, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
+    WM_CHAR, WM_KEYDOWN, WM_KEYUP,
 };
 
 const CT_EDIT: i32 = 50004;
 const VK_RETURN: usize = 0x0D;
 const EM_SETSEL: u32 = 0x00B1;
+
+/// 跨进程同步消息的超时上限。目标是另一个进程的对话框：它若挂死/忙于模态，
+/// 无超时的 SendMessageW 会把本进程主线程一起冻住（热键/搜索/浮窗全失灵）。
+const SEND_TIMEOUT_MS: u32 = 500;
+
+/// 带超时的跨进程 SendMessage；目标挂起或超时返回 None。
+fn send_timeout(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<usize> {
+    let mut result = 0usize;
+    let r = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            msg,
+            wp,
+            lp,
+            SMTO_ABORTIFHUNG,
+            SEND_TIMEOUT_MS,
+            Some(&mut result),
+        )
+    };
+    if r.0 == 0 {
+        None
+    } else {
+        Some(result)
+    }
+}
 
 fn class_name(hwnd: HWND) -> String {
     let mut buf = [0u16; 64];
@@ -78,20 +104,28 @@ pub fn navigate_dialog(hwnd: HWND, path: &str) -> bool {
             return false;
         }
 
-        // 保存原文件名，导航后恢复（避免动到用户已输入的名字）
-        let original: Vec<u16> = ss_platform::wide(&get_window_text(eh));
+        // 保存原文件名，导航后恢复（避免动到用户已输入的名字）。
+        // 读不到（目标挂起/超时）→ 放弃导航：否则导航后无法恢复，用户会丢文件名
+        let Some(orig_text) = get_window_text(eh) else {
+            return false;
+        };
+        let original: Vec<u16> = ss_platform::wide(&orig_text);
 
         // 模拟真实键入：选中全部 → 逐字符 WM_CHAR 打入目录路径 → 回车。
         // 真实输入会更新对话框内部模型，回车把「目录路径」识别为进入该目录（而非保存）。
         let _ = edit.SetFocus();
-        let _ = SendMessageW(eh, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+        // 全选失败必须放弃：WM_CHAR 会插到现有文本中间/尾部，
+        // 回车时「原文件名+目录路径」的混合串可能被对话框当保存名执行
+        if send_timeout(eh, EM_SETSEL, WPARAM(0), LPARAM(-1)).is_none() {
+            return false;
+        }
         for u in path.encode_utf16() {
             let _ = PostMessageW(Some(eh), WM_CHAR, WPARAM(u as usize), LPARAM(0));
         }
         let _ = PostMessageW(Some(eh), WM_KEYDOWN, WPARAM(VK_RETURN), LPARAM(0));
         let _ = PostMessageW(Some(eh), WM_KEYUP, WPARAM(VK_RETURN), LPARAM(0));
 
-        restore_filename_later(eh, original);
+        restore_filename_later(eh, original, path.to_string());
         true
     }
 }
@@ -143,27 +177,27 @@ unsafe fn has_native_hwnd(e: &IUIAutomationElement) -> HWND {
         .unwrap_or(HWND(std::ptr::null_mut()))
 }
 
-fn get_window_text(hwnd: HWND) -> String {
+/// 读窗口文本（带超时）。超时/目标挂起返回 None；空文本是合法值，返回 Some("")。
+fn get_window_text(hwnd: HWND) -> Option<String> {
     use windows::Win32::UI::WindowsAndMessaging::{WM_GETTEXT, WM_GETTEXTLENGTH};
-    unsafe {
-        let len = SendMessageW(hwnd, WM_GETTEXTLENGTH, None, None).0 as usize;
-        if len == 0 {
-            return String::new();
-        }
-        let mut buf = vec![0u16; len + 1];
-        let n = SendMessageW(
-            hwnd,
-            WM_GETTEXT,
-            Some(WPARAM(buf.len())),
-            Some(LPARAM(buf.as_mut_ptr() as isize)),
-        )
-        .0 as usize;
-        String::from_utf16_lossy(&buf[..n.min(buf.len())])
+    let len = send_timeout(hwnd, WM_GETTEXTLENGTH, WPARAM(0), LPARAM(0))?;
+    if len == 0 {
+        return Some(String::new());
     }
+    let mut buf = vec![0u16; len + 1];
+    let n = send_timeout(
+        hwnd,
+        WM_GETTEXT,
+        WPARAM(buf.len()),
+        LPARAM(buf.as_mut_ptr() as isize),
+    )?;
+    Some(String::from_utf16_lossy(&buf[..n.min(buf.len())]))
 }
 
 /// 导航完成后恢复原文件名（后台线程延时执行）。
-fn restore_filename_later(hwnd: HWND, original: Vec<u16>) {
+/// `typed_path` 为刚键入的目录路径：恢复前先校验编辑框内容仍是它（或已被对话框清空），
+/// 用户若在延时窗口内已开始输入新文件名，绝不覆盖。
+fn restore_filename_later(hwnd: HWND, original: Vec<u16>, typed_path: String) {
     // original 含结尾 NUL；为空（仅 [0]）则不恢复
     if original.len() <= 1 {
         return;
@@ -171,11 +205,31 @@ fn restore_filename_later(hwnd: HWND, original: Vec<u16>) {
     let raw = hwnd.0 as isize;
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(250));
-        use windows::Win32::UI::WindowsAndMessaging::SetWindowTextW;
-        use windows::core::PCWSTR;
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, WM_SETTEXT};
         let h = HWND(raw as *mut std::ffi::c_void);
         unsafe {
-            let _ = SetWindowTextW(h, PCWSTR(original.as_ptr()));
+            // HWND 失效/被系统回收复用的缓解：还活着且类名仍是 Edit 才动它（非完美，显著降概率）
+            if !IsWindow(Some(h)).as_bool() {
+                return;
+            }
         }
+        if class_name(h) != "Edit" {
+            return;
+        }
+        // 读当前内容（带超时，后台线程调用安全）；读不到 → 宁可不恢复也不盲写
+        let Some(cur) = get_window_text(h) else {
+            return;
+        };
+        let cur = cur.trim();
+        let ours = cur.is_empty()
+            || cur
+                .trim_end_matches('\\')
+                .eq_ignore_ascii_case(typed_path.trim_end_matches('\\'));
+        if !ours {
+            return; // 编辑框已是别的内容 = 用户已开始输入，跳过恢复
+        }
+        // SetWindowTextW 对跨进程窗口内部同步发 WM_SETTEXT，同样可能挂死 → 用带超时版本。
+        // original 尾带 NUL，作为 WM_SETTEXT 的 lparam 恰好合法。
+        let _ = send_timeout(h, WM_SETTEXT, WPARAM(0), LPARAM(original.as_ptr() as isize));
     });
 }
