@@ -158,6 +158,22 @@ pub fn record_recent(path: &str) {
 
 // ---- 设置 ----
 
+/// 桌面「文件夹映射区」的持久化配置（一个映射区一条）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct MapZone {
+    /// 被映射的文件夹完整路径
+    pub path: String,
+    /// 面板位置（虚拟屏幕坐标，物理像素）
+    pub x: i32,
+    pub y: i32,
+    /// 面板宽 / 展开总高（含标题栏，物理像素）
+    pub w: i32,
+    pub h: i32,
+    /// 锁定常开（不随鼠标离开自动收起）
+    pub locked: bool,
+}
+
 /// 全局设置（settings.json）。`#[serde(default)]` 保证旧文件缺字段时用默认值。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -181,6 +197,8 @@ pub struct Settings {
     pub popup_show_open: bool,
     /// 上次搜索词（跨重启记忆，启动时预填搜索框）
     pub last_query: String,
+    /// 桌面文件夹映射区列表
+    pub map_zones: Vec<MapZone>,
 }
 
 impl Default for Settings {
@@ -197,6 +215,7 @@ impl Default for Settings {
             popup_show_recent: true,
             popup_show_open: true,
             last_query: String::new(),
+            map_zones: Vec::new(),
         }
     }
 }
@@ -295,6 +314,27 @@ mod tests {
         assert_eq!(load_list(&p), vec!["C:\\a".to_string(), "D:\\b".to_string()]);
         assert!(p.exists()); // 合法文件不被动
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_old_json_without_map_zones() {
+        // 旧版 settings.json 没有 map_zones 字段 → 反序列化得空 Vec，不报错
+        let s: Settings = serde_json::from_str(r#"{"theme":"business_dark"}"#).unwrap();
+        assert_eq!(s.theme, "business_dark");
+        assert!(s.map_zones.is_empty());
+        // 带 map_zones 的往返
+        let mut s2 = Settings::default();
+        s2.map_zones.push(MapZone {
+            path: "C:\\Users\\x\\Desktop".into(),
+            x: 100,
+            y: 200,
+            w: 360,
+            h: 480,
+            locked: true,
+        });
+        let json = serde_json::to_string(&s2).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.map_zones, s2.map_zones);
     }
 
     #[test]

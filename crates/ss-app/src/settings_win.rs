@@ -118,7 +118,7 @@ fn set_text(hwnd: HWND, s: &str) {
 }
 
 /// 弹出系统「选择文件夹」对话框，返回所选完整路径。
-unsafe fn pick_folder(owner: HWND) -> Option<String> {
+pub(crate) unsafe fn pick_folder(owner: HWND) -> Option<String> {
     let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
     let opts = dlg.GetOptions().ok()?;
     dlg.SetOptions(opts | FOS_PICKFOLDERS).ok()?;
@@ -477,6 +477,7 @@ fn apply_and_close() {
             popup_show_recent: checked(u.recent_show),
             popup_show_open: checked(u.open),
             last_query: ss_config::last_query(), // 保留已记忆的上次搜索词，设置页不编辑此项
+            map_zones: ss_config::load_settings().map_zones, // 保留映射区配置，设置页不编辑此项
         })
     });
     if let Some(s) = s {
@@ -484,6 +485,7 @@ fn apply_and_close() {
         theme::set_current(theme::theme_by_name(&s.theme));
         crate::searchwin::refresh_theme();
         crate::searchwin::refresh_scopes(); // 预设文件夹变更后刷新下拉
+        crate::mapzone::refresh_theme();
         crate::set_autostart(s.autostart);
     }
     if let Some(h) = SUI.with(|c| c.borrow().as_ref().map(|u| u.hwnd)) {

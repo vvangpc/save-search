@@ -7,6 +7,7 @@
 
 mod dlgpopup;
 mod icons;
+mod mapzone;
 mod paint;
 mod searchwin;
 mod settings_win;
@@ -45,6 +46,8 @@ const TRAY_UID: u32 = 1;
 const IDM_OPEN: u32 = 40002;
 /// 菜单项：设置。
 const IDM_SETTINGS: u32 = 40003;
+/// 菜单项：新建映射区。
+const IDM_NEW_ZONE: u32 = 40004;
 /// 菜单项：退出。
 const IDM_EXIT: u32 = 40001;
 
@@ -138,9 +141,11 @@ unsafe fn show_context_menu(hwnd: HWND) {
         return;
     };
     let open_text = wide("打开搜索\tAlt+Space");
+    let zone_text = wide("新建映射区…");
     let set_text = wide("设置…");
     let exit_text = wide("退出 SaveSearch");
     let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN as usize, PCWSTR(open_text.as_ptr()));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_NEW_ZONE as usize, PCWSTR(zone_text.as_ptr()));
     let _ = AppendMenuW(menu, MF_STRING, IDM_SETTINGS as usize, PCWSTR(set_text.as_ptr()));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, PCWSTR(exit_text.as_ptr()));
@@ -183,6 +188,7 @@ unsafe extern "system" fn wndproc(
         WM_COMMAND => {
             match lo_word(wparam.0 as u32) {
                 IDM_OPEN => searchwin::toggle(),
+                IDM_NEW_ZONE => mapzone::new_zone_interactive(hwnd),
                 IDM_SETTINGS => settings_win::open(),
                 IDM_EXIT => {
                     let _ = DestroyWindow(hwnd);
@@ -358,6 +364,8 @@ fn main() -> windows::core::Result<()> {
         // 加单独的 0x800B(LOCATIONCHANGE)——避开中间 0x8004-0x800A 的
         // FOCUS/SELECTION/STATECHANGE 全系统高频事件反复唤醒主线程。
         let _ = dlgpopup::init();
+        // 功能3：桌面文件夹映射区（按配置恢复所有面板）
+        let _ = mapzone::init_all();
         let _ = SetWinEventHook(
             EVENT_OBJECT_DESTROY,
             EVENT_OBJECT_HIDE,
@@ -398,6 +406,9 @@ fn main() -> windows::core::Result<()> {
                 continue;
             }
             if searchwin::pretranslate(&msg) {
+                continue;
+            }
+            if mapzone::pretranslate(&msg) {
                 continue;
             }
             let _ = TranslateMessage(&msg);
