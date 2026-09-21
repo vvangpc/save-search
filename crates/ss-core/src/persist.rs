@@ -1,15 +1,15 @@
 //! 索引磁盘缓存（自定义二进制：长度前缀 + 原始字节块，快速读写）。
 //!
-//! FRN→id 映射以两个并行数组（frns / ids）落盘，加载时重建 HashMap。
+//! v3（SSIDX03）：落盘 `seq`（每节点 FRN 序列号）与 `rec_to_id`（MFT 记录号→id 稠密表），
+//! 取代 v2 的 frns/ids 并行数组 + 加载时重建 HashMap。旧版缓存 magic 不符 → 全量重建一次。
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::index::Index;
+use crate::index::{Index, MAX_RECORDS, NO_ID};
 
-const MAGIC: &[u8; 8] = b"SSIDX02\0";
+const MAGIC: &[u8; 8] = b"SSIDX03\0";
 
 fn write_vec<T: Copy>(w: &mut impl Write, v: &[T]) -> io::Result<()> {
     w.write_all(&(v.len() as u64).to_le_bytes())?;
@@ -64,15 +64,9 @@ pub fn save_index(idx: &Index, path: &Path) -> io::Result<()> {
         write_vec(&mut w, &idx.names_len)?;
         write_vec(&mut w, &idx.parent)?;
         write_vec(&mut w, &idx.flags)?;
+        write_vec(&mut w, &idx.seq)?;
         write_vec(&mut w, &idx.name_pool)?;
-        let mut frns = Vec::with_capacity(idx.frn_to_id.len());
-        let mut ids = Vec::with_capacity(idx.frn_to_id.len());
-        for (k, v) in &idx.frn_to_id {
-            frns.push(*k);
-            ids.push(*v);
-        }
-        write_vec(&mut w, &frns)?;
-        write_vec(&mut w, &ids)?;
+        write_vec(&mut w, &idx.rec_to_id)?;
         w.flush()?;
         w.get_ref().sync_all()?; // fsync：flush 只刷用户缓冲，sync_all 才落盘
     }
@@ -110,9 +104,9 @@ pub fn load_index(path: &Path) -> io::Result<Index> {
     let names_len: Vec<u16> = read_vec(&mut r, file_len)?;
     let parent: Vec<u32> = read_vec(&mut r, file_len)?;
     let flags: Vec<u16> = read_vec(&mut r, file_len)?;
+    let seq: Vec<u16> = read_vec(&mut r, file_len)?;
     let name_pool: Vec<u8> = read_vec(&mut r, file_len)?;
-    let frns: Vec<u64> = read_vec(&mut r, file_len)?;
-    let ids: Vec<u32> = read_vec(&mut r, file_len)?;
+    let rec_to_id: Vec<u32> = read_vec(&mut r, file_len)?;
 
     // 一致性校验：截断/位翻转的缓存若不在此拦截，越界下标会在搜索时 panic
     //（release 为 panic=abort，整个进程直接退出）。校验失败按坏缓存处理 → 全量重建。
@@ -122,7 +116,8 @@ pub fn load_index(path: &Path) -> io::Result<Index> {
         || names_len.len() != n
         || parent.len() != n
         || flags.len() != n
-        || frns.len() != ids.len()
+        || seq.len() != n
+        || rec_to_id.len() > MAX_RECORDS
     {
         return Err(bad("inconsistent array lengths"));
     }
@@ -136,13 +131,8 @@ pub fn load_index(path: &Path) -> io::Result<Index> {
             return Err(bad("parent out of range"));
         }
     }
-    if ids.iter().any(|&id| id as usize >= n) {
-        return Err(bad("frn id out of range"));
-    }
-
-    let mut frn_to_id = HashMap::with_capacity(frns.len());
-    for (k, v) in frns.into_iter().zip(ids) {
-        frn_to_id.insert(k, v);
+    if rec_to_id.iter().any(|&id| id != NO_ID && id as usize >= n) {
+        return Err(bad("record id out of range"));
     }
 
     // 墓碑计数不落盘（文件格式不变），加载后按 flags 重算（O(n) 位测试，毫秒级）
@@ -156,8 +146,9 @@ pub fn load_index(path: &Path) -> io::Result<Index> {
         names_len,
         parent,
         flags,
+        seq,
         name_pool,
-        frn_to_id,
+        rec_to_id,
         drive_letter,
         volume_serial,
         usn_journal_id,
@@ -168,6 +159,7 @@ pub fn load_index(path: &Path) -> io::Result<Index> {
 
 #[cfg(test)]
 mod tests {
+    use crate::category::Category;
     use crate::index::{Change, IndexBuilder};
 
     #[test]
@@ -184,10 +176,26 @@ mod tests {
             std::process::id()
         ));
         super::save_index(&idx, &path).unwrap();
-        let loaded = super::load_index(&path).unwrap();
+        let mut loaded = super::load_index(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(loaded.tombstones, 1); // 不落盘，按 flags 重算后一致
         assert_eq!(loaded.len(), idx.len());
+        // 记录号表与序列号一并还原：加载后增量仍能命中原节点
+        loaded.apply(&Change::Upsert { frn: 200, parent_frn: 5, attrs: 0, name: "c.txt".into() });
+        assert_eq!(loaded.len(), idx.len());
+        assert_eq!(loaded.search("c.txt", Category::All, 10).len(), 1);
+        assert_eq!(loaded.search("b.txt", Category::All, 10).len(), 0);
+    }
+
+    #[test]
+    fn old_format_is_rejected() {
+        let path = std::env::temp_dir().join(format!(
+            "ss-core-persist-old-{}.ssidx",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"SSIDX02\0garbage").unwrap();
+        assert!(super::load_index(&path).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }

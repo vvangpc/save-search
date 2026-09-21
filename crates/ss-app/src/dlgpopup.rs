@@ -184,9 +184,7 @@ pub fn show_for(dialog: HWND, entries: Vec<(EntryKind, String)>) {
                 p.entries = entries;
             }
         });
-        unsafe {
-            theme::apply_window(hwnd, &theme::current());
-        }
+        theme::apply_window(hwnd, &theme::current());
     }
     reposition(dialog, hwnd, list);
     unsafe {

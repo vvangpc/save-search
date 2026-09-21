@@ -499,25 +499,28 @@ fn same_path(a: &str, b: &str) -> bool {
 }
 
 /// 开机自启：建/删「最高权限」登录计划任务（免 UAC）。需管理员权限（本程序已提权）。
+/// schtasks 子进程要跑数百毫秒，放后台线程，不阻塞 UI 线程。
 pub(crate) fn set_autostart(enable: bool) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    // /TR 的值需内嵌引号：否则 exe 路径含空格时，任务动作会在首个空格处被截断
-    let exe_quoted = format!("\"{exe}\"");
-    let mut cmd = std::process::Command::new("schtasks");
-    if enable {
-        cmd.args([
-            "/Create", "/F", "/RL", "HIGHEST", "/SC", "ONLOGON", "/TN", "SaveSearch", "/TR",
-            &exe_quoted,
-        ]);
-    } else {
-        cmd.args(["/Delete", "/F", "/TN", "SaveSearch"]);
-    }
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let _ = cmd.output();
+    std::thread::spawn(move || {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // /TR 的值需内嵌引号：否则 exe 路径含空格时，任务动作会在首个空格处被截断
+        let exe_quoted = format!("\"{exe}\"");
+        let mut cmd = std::process::Command::new("schtasks");
+        if enable {
+            cmd.args([
+                "/Create", "/F", "/RL", "HIGHEST", "/SC", "ONLOGON", "/TN", "SaveSearch", "/TR",
+                &exe_quoted,
+            ]);
+        } else {
+            cmd.args(["/Delete", "/F", "/TN", "SaveSearch"]);
+        }
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let _ = cmd.output();
+    });
 }
 
 /// 索引缓存目录：`%LOCALAPPDATA%\SaveSearch\cache`。

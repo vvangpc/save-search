@@ -480,11 +480,15 @@ fn apply_and_close() {
         })
     });
     if let Some(s) = s {
+        let autostart_changed = ss_config::load_settings().autostart != s.autostart;
         ss_config::save_settings(&s);
         theme::set_current(theme::theme_by_name(&s.theme));
         crate::searchwin::refresh_theme();
         crate::searchwin::refresh_scopes(); // 预设文件夹变更后刷新下拉
-        crate::set_autostart(s.autostart);
+        // schtasks 要起子进程、数百毫秒；未改动时不跑，避免每次保存都卡一下
+        if autostart_changed {
+            crate::set_autostart(s.autostart);
+        }
     }
     if let Some(h) = SUI.with(|c| c.borrow().as_ref().map(|u| u.hwnd)) {
         unsafe {

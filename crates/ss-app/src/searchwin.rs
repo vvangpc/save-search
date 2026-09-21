@@ -5,18 +5,19 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 use ss_core::{Catalog, Category, SearchResult};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, DrawTextW, EndPaint, FillRect, GetDC, GetTextExtentPoint32W,
-    InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-    TRANSPARENT,
+    BeginPaint, CreateFontW, DrawTextW, EndPaint, FillRect, GetDC, GetMonitorInfoW,
+    GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint, ReleaseDC, SelectObject, SetBkMode,
+    SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DRAW_TEXT_FORMAT,
+    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT,
+    HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -88,7 +89,8 @@ struct Ui {
     combo: HWND,
     count: HWND,
     cats: Vec<HWND>,
-    results: Vec<SearchResult>,
+    /// Rc：绘制时克隆一次句柄即可在 RefCell 借用外读取，不必每帧逐项 clone 字符串
+    results: Rc<Vec<SearchResult>>,
     drives: Vec<char>,
     presets: Vec<String>,
     category: Category,
@@ -328,7 +330,7 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
                 combo,
                 count,
                 cats,
-                results: Vec::new(),
+                results: Rc::new(Vec::new()),
                 drives: Vec::new(),
                 presets: Vec::new(),
                 category: Category::All,
@@ -397,12 +399,29 @@ unsafe fn layout(hwnd: HWND) {
     let _ = MoveWindow(count, m, h - counth, w - 2 * m, counth - sc_dpi(2), true);
 }
 
+/// 在鼠标所在显示器的工作区居中偏上（原先固定按主屏尺寸算，多显示器时总弹在主屏）。
 unsafe fn center(hwnd: HWND) {
     let w = sc_dpi(820);
     let h = sc_dpi(560);
-    let sw = GetSystemMetrics(SM_CXSCREEN);
-    let sh = GetSystemMetrics(SM_CYSCREEN);
-    let _ = MoveWindow(hwnd, (sw - w) / 2, (sh - h) / 3, w, h, true);
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let (x, y) = if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+        let wr = mi.rcWork;
+        (
+            wr.left + (wr.right - wr.left - w) / 2,
+            wr.top + (wr.bottom - wr.top - h) / 3,
+        )
+    } else {
+        let sw = GetSystemMetrics(SM_CXSCREEN);
+        let sh = GetSystemMetrics(SM_CYSCREEN);
+        ((sw - w) / 2, (sh - h) / 3)
+    };
+    let _ = MoveWindow(hwnd, x, y, w, h, true);
 }
 
 fn get_text(edit: HWND) -> String {
@@ -519,7 +538,7 @@ fn do_search() {
     }
     UI.with(|c| {
         if let Some(ui) = c.borrow_mut().as_mut() {
-            ui.results = results;
+            ui.results = Rc::new(results);
             ui.scroll_y = 0.0;
             ui.target_y = 0.0;
             ui.sel = if ui.results.is_empty() { -1 } else { 0 };
@@ -572,6 +591,14 @@ unsafe fn open_path(path: &str, is_dir: bool) {
     }
 }
 
+/// 隐藏搜索窗的统一出口（Esc / 关闭 / 热键切换）：记住查询词、停动画、归还绘图后备缓冲。
+unsafe fn hide_window(search: HWND, list: HWND) {
+    persist_last_query();
+    stop_anim(list);
+    let _ = ShowWindow(search, SW_HIDE);
+    paint::release();
+}
+
 pub fn toggle() {
     let (search, edit, list) =
         match UI.with(|c| c.borrow().as_ref().map(|u| (u.search_hwnd, u.edit, u.list))) {
@@ -580,9 +607,7 @@ pub fn toggle() {
         };
     unsafe {
         if IsWindowVisible(search).as_bool() {
-            persist_last_query();
-            stop_anim(list);
-            let _ = ShowWindow(search, SW_HIDE);
+            hide_window(search, list);
         } else {
             theme::apply_window(search, &theme::current());
             center(search);
@@ -629,10 +654,8 @@ pub fn pretranslate(msg: &MSG) -> bool {
     }
     let vk = (msg.wParam.0 as u32) as u16;
     if vk == VK_ESCAPE.0 {
-        persist_last_query();
         unsafe {
-            stop_anim(list);
-            let _ = ShowWindow(search, SW_HIDE);
+            hide_window(search, list);
         }
         return true;
     }
@@ -924,7 +947,11 @@ unsafe fn paint_list(list: HWND) {
     let full = rc;
     paint::buffered(hdc, full, |mem, lrc| unsafe {
         FillRect(mem, &lrc, theme::solid_brush(t.bg));
-        let count = UI.with(|c| c.borrow().as_ref().map(|u| u.results.len() as i32).unwrap_or(0));
+        let results = UI.with(|c| c.borrow().as_ref().map(|u| u.results.clone()));
+        let Some(results) = results else {
+            return;
+        };
+        let count = results.len() as i32;
         if count > 0 && item_h > 0 {
             let sy = scroll_y as i32;
             let first = (sy / item_h).max(0);
@@ -937,9 +964,8 @@ unsafe fn paint_list(list: HWND) {
                     right: lrc.right,
                     bottom: y + item_h,
                 };
-                let r = UI.with(|c| c.borrow().as_ref().and_then(|u| u.results.get(i as usize).cloned()));
-                if let Some(r) = r {
-                    draw_one(mem, item_rect, &r, i == sel, i == hover, &t, fname, fpath);
+                if let Some(r) = results.get(i as usize) {
+                    draw_one(mem, item_rect, r, i == sel, i == hover, &t, fname, fpath);
                 }
             }
         }
@@ -1176,11 +1202,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_CLOSE => {
-            persist_last_query();
             if let Some(list) = UI.with(|c| c.borrow().as_ref().map(|u| u.list)) {
-                stop_anim(list);
+                hide_window(hwnd, list);
+            } else {
+                let _ = ShowWindow(hwnd, SW_HIDE);
             }
-            let _ = ShowWindow(hwnd, SW_HIDE);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),

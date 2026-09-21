@@ -5,15 +5,17 @@
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Subtree,
+    CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Descendants,
+    UIA_AutomationIdPropertyId, UIA_ControlTypePropertyId, UIA_EditControlTypeId,
+    UIA_NamePropertyId, UIA_NativeWindowHandlePropertyId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, GetClassNameW, PostMessageW, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
     WM_CHAR, WM_KEYDOWN, WM_KEYUP,
 };
 
-const CT_EDIT: i32 = 50004;
 const VK_RETURN: usize = 0x0D;
 const EM_SETSEL: u32 = 0x00B1;
 
@@ -94,15 +96,9 @@ pub fn navigate_dialog(hwnd: HWND, path: &str) -> bool {
             Ok(r) => r,
             Err(_) => return false,
         };
-        let Some(edit) = find_filename_edit(&uia, &root) else {
+        let Some((edit, eh)) = find_filename_edit(&uia, &root) else {
             return false;
         };
-        let eh = edit
-            .CurrentNativeWindowHandle()
-            .unwrap_or(HWND(std::ptr::null_mut()));
-        if eh.0.is_null() {
-            return false;
-        }
 
         // 保存原文件名，导航后恢复（避免动到用户已输入的名字）。
         // 读不到（目标挂起/超时）→ 放弃导航：否则导航后无法恢复，用户会丢文件名
@@ -130,51 +126,58 @@ pub fn navigate_dialog(hwnd: HWND, path: &str) -> bool {
     }
 }
 
-/// 定位「文件名」编辑框（保存/打开对话框通用）。一次遍历，按优先级取：
+/// 定位「文件名」编辑框（保存/打开对话框通用），返回 (元素, 其原生窗口句柄)。
+/// 一次查询，按优先级取：
 /// 1) 名称含「文件名」/「file name」的 Edit（最稳，跨语言/版本）；
 /// 2) AutomationId 为 "1001"/"1148" 的 Edit；
 /// 3) 第一个有真实窗口句柄的 Edit（文件列表列的 Edit 句柄为 0，自动排除）。
+///
+/// 性能：用「ControlType == Edit」属性条件让 UIA 在遍历时就过滤（对话框里文件列表的
+/// 每个条目都是 UIA 元素，原先 TrueCondition 全取再逐个查类型，几千个文件的目录会
+/// 触发上千次跨进程调用、单击浮窗卡顿数秒）；再用缓存请求把 Name/AutomationId/句柄
+/// 随查询一次带回，之后读 `Cached*` 零往返。
 unsafe fn find_filename_edit(
     uia: &IUIAutomation,
     root: &IUIAutomationElement,
-) -> Option<IUIAutomationElement> {
-    let cond = uia.CreateTrueCondition().ok()?;
-    let arr = root.FindAll(TreeScope_Subtree, &cond).ok()?;
+) -> Option<(IUIAutomationElement, HWND)> {
+    let cond = uia
+        .CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_EditControlTypeId.0))
+        .ok()?;
+    let cache = uia.CreateCacheRequest().ok()?;
+    cache.AddProperty(UIA_NamePropertyId).ok()?;
+    cache.AddProperty(UIA_AutomationIdPropertyId).ok()?;
+    cache.AddProperty(UIA_NativeWindowHandlePropertyId).ok()?;
+    let arr = root.FindAllBuildCache(TreeScope_Descendants, &cond, &cache).ok()?;
     let n = arr.Length().unwrap_or(0);
-    let mut by_name: Option<IUIAutomationElement> = None;
-    let mut by_id: Option<IUIAutomationElement> = None;
-    let mut first: Option<IUIAutomationElement> = None;
+    let mut by_name: Option<(IUIAutomationElement, HWND)> = None;
+    let mut by_id: Option<(IUIAutomationElement, HWND)> = None;
+    let mut first: Option<(IUIAutomationElement, HWND)> = None;
     for i in 0..n {
         let Ok(e) = arr.GetElement(i) else { continue };
-        if e.CurrentControlType().map(|c| c.0).unwrap_or(0) != CT_EDIT {
-            continue;
-        }
-        if has_native_hwnd(&e).0.is_null() {
+        let hwnd = e
+            .CachedNativeWindowHandle()
+            .unwrap_or(HWND(std::ptr::null_mut()));
+        if hwnd.0.is_null() {
             continue;
         }
         let name = e
-            .CurrentName()
+            .CachedName()
             .map(|b| b.to_string())
             .unwrap_or_default()
             .to_lowercase();
         if by_name.is_none() && (name.contains("文件名") || name.contains("file name")) {
-            by_name = Some(e);
+            by_name = Some((e, hwnd));
             continue;
         }
-        let aid = e.CurrentAutomationId().map(|b| b.to_string()).unwrap_or_default();
+        let aid = e.CachedAutomationId().map(|b| b.to_string()).unwrap_or_default();
         if by_id.is_none() && (aid == "1001" || aid == "1148") {
-            by_id = Some(e.clone());
+            by_id = Some((e.clone(), hwnd));
         }
         if first.is_none() {
-            first = Some(e);
+            first = Some((e, hwnd));
         }
     }
     by_name.or(by_id).or(first)
-}
-
-unsafe fn has_native_hwnd(e: &IUIAutomationElement) -> HWND {
-    e.CurrentNativeWindowHandle()
-        .unwrap_or(HWND(std::ptr::null_mut()))
 }
 
 /// 读窗口文本（带超时）。超时/目标挂起返回 None；空文本是合法值，返回 Some("")。
