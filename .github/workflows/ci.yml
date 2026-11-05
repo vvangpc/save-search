@@ -17,6 +17,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Prepare release notes from CHANGELOG (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: ./tools/release-notes.ps1 -Tag $env:RELEASE_TAG -OutputPath "$env:RUNNER_TEMP/release-notes.md"
+
       # windows-latest 自带 rustup，但显式装 stable-msvc + clippy 更可预测；
       # 会尊重仓库 rust-toolchain.toml（stable + x86_64-pc-windows-msvc）。
       - name: Setup Rust toolchain
@@ -58,6 +65,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
+          body_path: ${{ runner.temp }}/release-notes.md
+          fail_on_unmatched_files: true
           files: |
             SaveSearch-*.zip
             target/release/ss-app.exe

@@ -10,7 +10,8 @@ use std::ffi::c_void;
 use ss_platform::wide;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE, GENERIC_READ, HANDLE,
+    CloseHandle, ERROR_HANDLE_EOF, ERROR_JOURNAL_NOT_ACTIVE, ERROR_JOURNAL_ENTRY_DELETED,
+    ERROR_JOURNAL_DELETE_IN_PROGRESS, GENERIC_READ, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetVolumeInformationW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ,
@@ -29,14 +30,23 @@ const USN_REASON_FILE_CREATE: u32 = 0x0000_0100;
 const USN_REASON_FILE_DELETE: u32 = 0x0000_0200;
 const USN_REASON_RENAME_NEW_NAME: u32 = 0x0000_2000;
 const USN_REASON_HARD_LINK_CHANGE: u32 = 0x0001_0000;
+const USN_REASON_BASIC_INFO_CHANGE: u32 = 0x0000_8000;
 
-/// 只让内核返回会改变「名字 / 父目录 / 存在性」的记录。写入、属性、时间戳等
-/// 高频变更（DATA_OVERWRITE/EXTEND、BASIC_INFO_CHANGE、CLOSE…）对索引无意义，
-/// 全收会让每 2 秒的轮询白白搬运并解析大量记录。
+/// 订阅名字、父目录、存在性以及隐藏/系统属性的变化。
+/// BASIC_INFO_CHANGE 也包含时间戳变化，但必须订阅才能保持属性筛选正确；
+/// 没有实际属性变化的 Upsert 会被索引层去重。
 const READ_REASON_MASK: u32 = USN_REASON_FILE_CREATE
     | USN_REASON_FILE_DELETE
     | USN_REASON_RENAME_NEW_NAME
-    | USN_REASON_HARD_LINK_CHANGE;
+    | USN_REASON_HARD_LINK_CHANGE
+    | USN_REASON_BASIC_INFO_CHANGE;
+
+/// 日志已删除、重建或截断，旧游标无法继续追赶，需要重新建立索引。
+pub fn usn_requires_rebuild(error: &windows::core::Error) -> bool {
+    [ERROR_JOURNAL_NOT_ACTIVE, ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_DELETE_IN_PROGRESS]
+        .iter()
+        .any(|code| error.code() == code.to_hresult())
+}
 
 /// `CREATE_USN_JOURNAL_DATA`（在 windows-rs 的 Wdk 模块下，这里自定义等价布局免开 feature）。
 #[repr(C)]
@@ -363,4 +373,43 @@ pub fn build_index_for_drive_with_progress(
     let mut index = builder.finish();
     index.set_usn_state(serial, journal.UsnJournalID, journal.NextUsn);
     Ok(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attribute_only_record_updates_existing_node() {
+        assert_ne!(READ_REASON_MASK & USN_REASON_BASIC_INFO_CHANGE, 0);
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, 0, "a");
+        let mut idx = b.finish();
+        let mut buf = vec![0u8; 72];
+        let rec = &mut buf[8..];
+        rec[0..4].copy_from_slice(&64u32.to_le_bytes());
+        rec[4..6].copy_from_slice(&2u16.to_le_bytes());
+        rec[8..16].copy_from_slice(&100u64.to_le_bytes());
+        rec[16..24].copy_from_slice(&5u64.to_le_bytes());
+        rec[40..44].copy_from_slice(&USN_REASON_BASIC_INFO_CHANGE.to_le_bytes());
+        rec[52..56].copy_from_slice(&2u32.to_le_bytes());
+        rec[56..58].copy_from_slice(&2u16.to_le_bytes());
+        rec[58..60].copy_from_slice(&60u16.to_le_bytes());
+        rec[60..62].copy_from_slice(&(b'a' as u16).to_le_bytes());
+        let mut changes = Vec::new();
+        parse_records(&buf, buf.len(), &mut changes);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(idx.apply_all(&changes), 1);
+        assert_ne!(idx.flags[1] & crate::index::IS_HIDDEN, 0);
+    }
+
+    #[test]
+    fn only_broken_journals_require_rebuild() {
+        for code in [ERROR_JOURNAL_NOT_ACTIVE, ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_DELETE_IN_PROGRESS] {
+            assert!(usn_requires_rebuild(&windows::core::Error::from_hresult(code.to_hresult())));
+        }
+        assert!(!usn_requires_rebuild(&windows::core::Error::from_hresult(
+            windows::Win32::Foundation::ERROR_ACCESS_DENIED.to_hresult()
+        )));
+    }
 }

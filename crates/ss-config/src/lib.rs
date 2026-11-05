@@ -103,7 +103,8 @@ fn atomic_write_json(path: &Path, bytes: &[u8]) -> io::Result<()> {
 struct Store<T> {
     path: PathBuf,
     value: RwLock<T>,
-    writer: Mutex<()>,
+    /// 串行写入，并记录是否还有上次失败后尚未落盘的内容。
+    writer: Mutex<bool>,
 }
 
 impl<T: Clone + PartialEq + Serialize> Store<T> {
@@ -111,7 +112,7 @@ impl<T: Clone + PartialEq + Serialize> Store<T> {
         Store {
             path,
             value: RwLock::new(value),
-            writer: Mutex::new(()),
+            writer: Mutex::new(false),
         }
     }
 
@@ -120,19 +121,21 @@ impl<T: Clone + PartialEq + Serialize> Store<T> {
         f(&self.value.read().unwrap_or_else(|p| p.into_inner()))
     }
 
-    /// 修改并保存。内容没有变化时不写盘。
+    /// 修改并保存。内容没有变化且没有待落盘内容时不写盘。
     fn update<R>(&self, f: impl FnOnce(&mut T) -> R) -> io::Result<R> {
-        let _writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let mut dirty = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         let (snapshot, result) = {
             let mut value = self.value.write().unwrap_or_else(|p| p.into_inner());
             let before = value.clone();
             let result = f(&mut value);
-            let snapshot = (*value != before).then(|| value.clone());
+            *dirty |= *value != before;
+            let snapshot = (*dirty).then(|| value.clone());
             (snapshot, result)
         };
         if let Some(snapshot) = snapshot {
             let json = serde_json::to_vec_pretty(&snapshot).map_err(io::Error::other)?;
             atomic_write_json(&self.path, &json)?;
+            *dirty = false;
         }
         Ok(result)
     }
@@ -259,10 +262,6 @@ pub fn record_recent(path: &str) {
 
 // ---- 设置 ----
 
-/// `enter_action` 的取值。
-pub const ENTER_OPEN: &str = "open";
-pub const ENTER_REVEAL: &str = "reveal";
-
 /// 全局设置（settings.json）。`#[serde(default)]` 保证旧文件缺字段时用默认值。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -296,8 +295,6 @@ pub struct Settings {
     pub exclude_dirs: Vec<String>,
     /// 不显示带隐藏或系统属性的文件
     pub hide_system: bool,
-    /// Enter 的行为：[`ENTER_OPEN`] 打开文件（文件夹直接打开），[`ENTER_REVEAL`] 在资源管理器中定位
-    pub enter_action: String,
 }
 
 impl Default for Settings {
@@ -319,7 +316,6 @@ impl Default for Settings {
             last_category: String::new(),
             exclude_dirs: Vec::new(),
             hide_system: false,
-            enter_action: ENTER_OPEN.into(),
         }
     }
 }
@@ -333,9 +329,6 @@ impl Settings {
         self.recent_max = self.recent_max.min(50);
         if self.hotkey.trim().is_empty() {
             self.hotkey = DEFAULT_HOTKEY.into();
-        }
-        if self.enter_action != ENTER_OPEN && self.enter_action != ENTER_REVEAL {
-            self.enter_action = ENTER_OPEN.into();
         }
     }
 }
@@ -460,7 +453,6 @@ mod tests {
         assert_eq!(s.last_query, "abc");
         // 新字段取默认值
         assert_eq!(s.hotkey, "Alt+Space");
-        assert_eq!(s.enter_action, ENTER_OPEN);
         assert!(s.exclude_dirs.is_empty());
         assert!(!s.hide_system);
         assert!(s.popup_enabled);
@@ -477,9 +469,11 @@ mod tests {
         assert_eq!((high.result_limit, high.recent_max), (5000, 50));
         let bad = parse_settings(br#"{"hotkey":"  ","enter_action":"explode"}"#).unwrap();
         assert_eq!(bad.hotkey, "Alt+Space");
-        assert_eq!(bad.enter_action, ENTER_OPEN);
-        let reveal = parse_settings(br#"{"enter_action":"reveal"}"#).unwrap();
-        assert_eq!(reveal.enter_action, ENTER_REVEAL);
+        // 废弃的 enter_action 被忽略，旧配置不能反转固定的定位手势。
+        for value in ["open", "reveal", "explode"] {
+            let legacy = format!(r#"{{"enter_action":"{value}"}}"#);
+            assert_eq!(parse_settings(legacy.as_bytes()).unwrap(), Settings::default());
+        }
     }
 
     #[test]
@@ -525,6 +519,14 @@ mod tests {
         // 内容变化：返回错误，但进程内已更新
         assert!(store.update(|v| v.push("b".to_string())).is_err());
         assert_eq!(store.read(Vec::len), 2);
+        // 同样的内容重试必须继续报错，不能把缓存命中当作保存成功。
+        assert!(store.update(|_| ()).is_err());
+        fs::remove_file(&blocker).unwrap();
+        fs::create_dir(&blocker).unwrap();
+        store.update(|_| ()).unwrap();
+        let persisted: Vec<String> =
+            serde_json::from_slice(&fs::read(blocker.join("v.json")).unwrap()).unwrap();
+        assert_eq!(persisted, ["a", "b"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

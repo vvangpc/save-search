@@ -401,6 +401,7 @@ fn main() -> windows::core::Result<()> {
                 use std::time::Instant;
                 // 防重建风暴：单盘重建（无论成败）后至少间隔 6 小时再评估
                 let mut last_rebuild: Vec<(char, Instant)> = Vec::new();
+                let mut last_recovery: Vec<(char, Instant)> = Vec::new();
                 loop {
                     std::thread::sleep(Duration::from_secs(2));
                     let positions = match catalog3.read().as_ref() {
@@ -409,15 +410,36 @@ fn main() -> windows::core::Result<()> {
                     };
                     let mut all_read = true;
                     for (letter, jid, from) in positions {
-                        if let Ok((changes, new_next)) = ss_core::read_changes(letter, jid, from) {
-                            if changes.is_empty() && new_next == from {
-                                continue;
-                            }
-                            if let Some(c) = catalog3.write().as_mut() {
-                                c.apply_drive_changes(letter, &changes, new_next);
-                            }
-                        } else {
+                        let result = ss_core::read_changes(letter, jid, from);
+                        let recover = result.as_ref().err().is_some_and(ss_core::usn_requires_rebuild);
+                        if result.is_err() {
                             all_read = false;
+                        }
+                        let applied = catalog3.write().as_mut().is_some_and(|c| {
+                            c.apply_drive_update(letter, jid, from, result.map_err(|e| format!("读取文件变更失败：{e}")))
+                        });
+                        if !applied {
+                            all_read = false;
+                            continue;
+                        }
+                        if recover && !last_recovery.iter().any(|(l, t)| {
+                            *l == letter && t.elapsed() < Duration::from_secs(30)
+                        }) {
+                            last_recovery.retain(|(l, _)| *l != letter);
+                            last_recovery.push((letter, Instant::now()));
+                            // 锁外重建，失败保留旧索引；冷却后再次尝试恢复。
+                            match ss_core::build_index_for_drive(letter) {
+                                Ok(idx) => {
+                                    if let Some(c) = catalog3.write().as_mut() {
+                                        c.replace_index_if_current(idx, jid, from);
+                                    }
+                                }
+                                Err(e) => {
+                                    if let Some(c) = catalog3.write().as_mut() {
+                                        c.apply_drive_update(letter, jid, from, Err(format!("重建索引失败：{e}")));
+                                    }
+                                }
+                            }
                         }
                     }
                     if all_read {

@@ -6,6 +6,25 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-05
+
+### 变更
+
+- `Enter` 和双击改为定位：文件打开所在文件夹并选中，文件夹直接打开自身。
+- 直接打开文件改用 `Ctrl + 双击`，底部快捷键提示同步更新；`Ctrl + Enter` 保留定位功能。
+- 发布时由 GitHub Actions 在远端构建、测试和打包，并自动将对应版本的更新日志同步到 GitHub Release。
+
+### 移除
+
+- 移除旧 `enter_action` 配置及操作反转逻辑，旧配置文件仍可正常读取。
+
+### 修复
+
+- 修复修改文件或文件夹的隐藏、系统属性后，搜索筛选未及时更新的问题。缓存格式升级到 v5，首次启动会重建旧索引。
+- 修复 USN 日志被删除、重建或截断后，索引无法继续更新的问题；自动重建恢复，失败时保留旧索引并记录原因，限频重试。
+- 修复后台读取期间索引已替换或磁盘已移除时，过期结果可能覆盖当前状态的问题。
+- 修复配置写盘失败后，再次保存相同内容返回成功却未重新写盘的问题。
+
 ## [0.4.0] - 2026-11-05
 
 这个版本重做了全部界面，并修复了搜索结果不完整等问题。升级后首次启动会自动重建一次索引。
@@ -126,7 +145,8 @@
 
 - 首个版本：NTFS 文件搜索、保存和打开对话框位置快选、托盘常驻。
 
-[Unreleased]: https://github.com/vvangpc/save-search/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/vvangpc/save-search/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/vvangpc/save-search/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/vvangpc/save-search/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/vvangpc/save-search/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/vvangpc/save-search/compare/v0.2.2...v0.2.3

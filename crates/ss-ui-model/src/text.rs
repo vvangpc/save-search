@@ -1,4 +1,4 @@
-//! 显示文字：命中高亮分段、路径拆分、大小和日期格式、Enter 的行为。
+//! 显示文字：命中高亮分段、路径拆分、大小和日期格式。
 
 /// 把文件名按命中区间（字节）分段，返回（文字，是否命中）。
 /// 区间不在字符边界上时整体不高亮，不会出错。
@@ -92,22 +92,6 @@ pub fn format_date(now: LocalTime, t: LocalTime) -> String {
     }
 }
 
-/// 对结果执行的操作。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpenOp {
-    Open,
-    Reveal,
-}
-
-/// Enter 或 Ctrl+Enter 对应的操作。`enter_reveals` 来自设置，Ctrl+Enter 总是另一个操作。
-pub fn enter_op(enter_reveals: bool, ctrl: bool) -> OpenOp {
-    if enter_reveals != ctrl {
-        OpenOp::Reveal
-    } else {
-        OpenOp::Open
-    }
-}
-
 /// 输入框的选区是否只选中了部分文字。这时 Ctrl+C 复制文字，否则复制结果路径。
 pub fn is_partial_selection(start: u32, end: u32, len: u32) -> bool {
     start != end && !(start == 0 && end >= len)
@@ -165,14 +149,6 @@ mod tests {
         // 跨月和跨年的“昨天”
         assert_eq!(format_date(t(2026, 3, 1, 0, 0), t(2026, 2, 28, 8, 5)), "昨天 08:05");
         assert_eq!(format_date(t(2026, 1, 1, 0, 0), t(2025, 12, 31, 23, 59)), "昨天 23:59");
-    }
-
-    #[test]
-    fn enter_behaviour_follows_decision() {
-        assert_eq!(enter_op(false, false), OpenOp::Open);
-        assert_eq!(enter_op(false, true), OpenOp::Reveal);
-        assert_eq!(enter_op(true, false), OpenOp::Reveal);
-        assert_eq!(enter_op(true, true), OpenOp::Open);
     }
 
     #[test]

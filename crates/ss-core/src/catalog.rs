@@ -293,29 +293,72 @@ impl Catalog {
         }
     }
 
+    fn position_matches(&self, letter: char, journal_id: u64, from: i64) -> bool {
+        self.indexes.iter().any(|idx| {
+            idx.drive_letter() == letter
+                && idx.usn_journal_id() == journal_id
+                && idx.next_usn() == from
+        })
+    }
+
+    /// 应用锁外读取的结果；索引已被替换、移除或推进时丢弃过期结果。
+    /// 成功（包括空轮询）清除旧错误，失败保留旧索引并记录原因。
+    pub fn apply_drive_update(
+        &mut self,
+        letter: char,
+        journal_id: u64,
+        from: i64,
+        result: Result<(Vec<Change>, i64), String>,
+    ) -> bool {
+        if !self.position_matches(letter, journal_id, from) {
+            return false;
+        }
+        let error = match result {
+            Ok((changes, next)) => {
+                self.apply_drive_changes(letter, &changes, next);
+                None
+            }
+            Err(reason) => Some(reason),
+        };
+        if let Some(status) = self.statuses.iter_mut().find(|s| s.letter == letter) {
+            status.last_error = error;
+        }
+        true
+    }
+
+    /// 恢复期间若该盘已被移除或换入新索引，不覆盖更新的状态。
+    pub fn replace_index_if_current(&mut self, idx: Index, journal_id: u64, from: i64) -> bool {
+        if !self.position_matches(idx.drive_letter(), journal_id, from) {
+            return false;
+        }
+        self.replace_index(idx);
+        true
+    }
+
     /// 增量追赶（供定时器周期调用），返回本次应用的变更总数。
     pub fn catch_up(&mut self) -> usize {
         let mut total = 0;
-        let mut changed = false;
-        for idx in &mut self.indexes {
-            let letter = idx.drive_letter();
-            let jid = idx.usn_journal_id();
-            let from = idx.next_usn();
+        for (letter, jid, from) in self.usn_positions() {
             let last_error = match read_changes(letter, jid, from) {
                 Ok((changes, new_next)) => {
                     total += changes.len();
-                    changed |= idx.apply_all(&changes) > 0;
-                    idx.set_next_usn(new_next);
+                    self.apply_drive_changes(letter, &changes, new_next);
                     None
+                }
+                Err(e) if crate::mft::usn_requires_rebuild(&e) => {
+                    match build_index_for_drive(letter) {
+                        Ok(idx) => {
+                            self.replace_index(idx);
+                            None
+                        }
+                        Err(rebuild_error) => Some(format!("重建索引失败：{rebuild_error}")),
+                    }
                 }
                 Err(e) => Some(format!("读取文件变更失败：{e}")),
             };
             if let Some(status) = self.statuses.iter_mut().find(|s| s.letter == letter) {
                 status.last_error = last_error;
             }
-        }
-        if changed {
-            self.generation += 1;
         }
         total
     }
@@ -726,6 +769,32 @@ mod tests {
         let resp = cat.query(&r);
         assert!(!resp.cancelled);
         assert_eq!(resp.items.len(), 2);
+    }
+
+    #[test]
+    fn drive_sync_records_errors_and_recovers_without_accepting_stale_results() {
+        let mut cat = sample_catalog();
+        let (_, jid, from) = cat.usn_positions()[0];
+        assert!(cat.apply_drive_update('C', jid, from, Err("journal expired".into())));
+        assert_eq!(cat.drive_statuses()[0].last_error.as_deref(), Some("journal expired"));
+        // 成功的空轮询也必须清除上次错误。
+        assert!(cat.apply_drive_update('C', jid, from, Ok((vec![], from))));
+        assert!(cat.drive_statuses()[0].last_error.is_none());
+
+        let mut b = IndexBuilder::new(b'C');
+        b.push(999, 5, 0, "recovered.txt");
+        let mut recovered = b.finish();
+        recovered.set_usn_state(1, jid + 1, from + 10);
+        assert!(cat.replace_index_if_current(recovered, jid, from));
+        assert_eq!(cat.query(&req("recovered", Scope::All)).total_hits, 1);
+        assert!(!cat.apply_drive_update('C', jid, from, Err("stale error".into())));
+        assert!(!cat.apply_drive_update('C', jid, from, Ok((vec![Change::Delete { frn: 999 }], from + 20))));
+        assert_eq!(cat.query(&req("recovered", Scope::All)).total_hits, 1);
+        assert!(cat.drive_statuses()[0].last_error.is_none());
+
+        cat.remove_drive('C');
+        assert!(!cat.replace_index_if_current(IndexBuilder::new(b'C').finish(), jid + 1, from + 10));
+        assert!(!cat.drive_letters().contains(&'C'));
     }
 
     #[test]

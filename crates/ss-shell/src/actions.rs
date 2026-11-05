@@ -112,9 +112,12 @@ impl Drop for Pidl {
     }
 }
 
-/// 在资源管理器中打开所在文件夹并选中 `path`。
+/// 文件：打开所在文件夹并选中；文件夹：直接打开该文件夹。
 pub fn reveal(path: &str) -> Result<(), ActionError> {
     ensure_exists(path)?;
+    if Path::new(path).is_dir() {
+        return open_deelevated(path);
+    }
     let pidl = Pidl::parse(path, "定位文件")?;
     unsafe { SHOpenFolderAndSelectItems(pidl.0, None, 0) }.map_err(system_error("定位文件"))
 }

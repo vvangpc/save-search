@@ -18,4 +18,5 @@ pub use drives::{list_volumes, ntfs_fixed_drives, DriveKind, VolumeInfo};
 pub use index::{Change, Index, IndexBuilder, SearchResult, IS_DIR, ROOT_ID};
 pub use mft::{
     build_index_for_drive, build_index_for_drive_with_progress, current_usn_state, read_changes,
+    usn_requires_rebuild,
 };

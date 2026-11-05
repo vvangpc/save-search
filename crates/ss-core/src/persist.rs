@@ -4,6 +4,7 @@
 //! 取代 v2 的 frns/ids 并行数组 + 加载时重建 HashMap。
 //! v4（SSIDX04）：结构不变，`flags` 增加隐藏和系统属性。旧版缓存没有这两位，
 //! magic 不符会被拒绝，随后全量重建一次。
+//! v5（SSIDX05）：结构不变，重建曾遗漏属性变化的旧缓存。
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -11,7 +12,8 @@ use std::path::Path;
 
 use crate::index::{Index, MAX_RECORDS, NO_ID};
 
-const MAGIC: &[u8; 8] = b"SSIDX04\0";
+// v5 强制重建：v4 运行期间遗漏过属性变化，不能继续信任其隐藏/系统属性。
+const MAGIC: &[u8; 8] = b"SSIDX05\0";
 
 fn write_vec<T: Copy>(w: &mut impl Write, v: &[T]) -> io::Result<()> {
     w.write_all(&(v.len() as u64).to_le_bytes())?;
@@ -223,6 +225,18 @@ mod tests {
         let err = super::load_index(&path).err().expect("v3 缓存必须被拒绝");
         let _ = std::fs::remove_file(&path);
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn v4_cache_is_rejected_to_refresh_stale_attributes() {
+        let idx = IndexBuilder::new(b'C').finish();
+        let path = std::env::temp_dir().join(format!("ss-core-persist-v4-{}.ssidx", std::process::id()));
+        super::save_index(&idx, &path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[..8].copy_from_slice(b"SSIDX04\0");
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(super::load_index(&path).err().unwrap().kind(), std::io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

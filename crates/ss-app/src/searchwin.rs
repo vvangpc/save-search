@@ -1,7 +1,7 @@
 //! 搜索窗口：搜索框 + 盘符下拉 + 分类标签栏 + **自绘平滑滚动结果列表**。
 //!
 //! 结果列表是自绘的逐像素虚拟列表（带惯性缓动动画 + 整窗双缓冲），滚动顺滑无闪烁。
-//! 全局热键 Alt+Space 弹出/隐藏；输入即时搜索；分类标签筛选；回车/双击打开；Esc 隐藏。
+//! 全局热键 Alt+Space 弹出/隐藏；输入即时搜索；分类标签筛选；回车/双击定位；Ctrl+双击打开；Esc 隐藏。
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -11,10 +11,10 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 use ss_core::{Catalog, Category, CategoryCounts, DriveState, Scope, ScopeStatus, SearchResult};
 use ss_ui_model::{
-    all_drives_label, banner, body, compact, ease_toward, enter_op, highlight_segments,
+    all_drives_label, banner, body, compact, ease_toward, highlight_segments,
     is_partial_selection, leaf_of, moved, parent_of, reselect, scope_index, scope_key,
     scroll_from_thumb, scroll_thumb, status_line, Banner, Body, BuildProgress, DriveFailure,
-    ListGeometry, OpenOp, RequestSeq, ScopeProblem, SelMove, ViewInput,
+    ListGeometry, RequestSeq, ScopeProblem, SelMove, ViewInput,
 };
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -106,7 +106,7 @@ enum Act {
     ClearCategory,
     RemovePreset,
     RetryFailedDrives,
-    /// 打开或定位选中项，参数是“按下了 Ctrl”。
+    /// 打开或定位选中项，参数表示是否直接打开文件。
     Activate(bool),
     CopyPath,
 }
@@ -1011,7 +1011,7 @@ fn run_act(act: Act) {
         Act::RetryFailedDrives => {
             crate::rebuild_drives(failed);
         }
-        Act::Activate(ctrl) => activate_selected(ctrl),
+        Act::Activate(open_directly) => activate_selected(open_directly),
         Act::CopyPath => {
             copy_selected(false);
         }
@@ -1087,18 +1087,18 @@ fn report_action_error(path: &str, e: ss_shell::ActionError) {
     }
 }
 
-/// 按 Enter 或 Ctrl+Enter 的规则打开或定位选中项。成功后隐藏窗口。
-fn activate_selected(ctrl: bool) {
+/// 默认定位；Ctrl+双击或底部“打开”操作直接打开。成功后隐藏窗口。
+fn activate_selected(open_directly: bool) {
     let Some((search, list)) = UI.with(|c| c.borrow().as_ref().map(|u| (u.search_hwnd, u.list))) else {
         return;
     };
     let Some((path, _)) = selected_item() else {
         return;
     };
-    let enter_reveals = ss_config::load_settings().enter_action == ss_config::ENTER_REVEAL;
-    let result = match enter_op(enter_reveals, ctrl) {
-        OpenOp::Open => ss_shell::open_deelevated(&path),
-        OpenOp::Reveal => ss_shell::reveal(&path),
+    let result = if open_directly {
+        ss_shell::open_deelevated(&path)
+    } else {
+        ss_shell::reveal(&path)
     };
     match result {
         Ok(()) => unsafe { hide_window(search, list) },
@@ -1243,7 +1243,7 @@ pub fn pretranslate(msg: &MSG) -> bool {
         return true;
     }
     if vk == VK_RETURN.0 {
-        activate_selected(key_down(VK_CONTROL.0));
+        activate_selected(false);
         return true;
     }
     if vk == VK_C.0 && key_down(VK_CONTROL.0) {
@@ -1792,11 +1792,9 @@ unsafe fn paint_foot(hdc: HDC, rc: RECT, status: &str, is_toast: bool, t: &Theme
     FillRect(hdc, &rc, theme::solid_brush(t.alt_bg));
     let line = RECT { left: rc.left, top: rc.top, right: rc.right, bottom: rc.top + 1 };
     FillRect(hdc, &line, theme::solid_brush(t.border));
-    let enter_reveals = ss_config::load_settings().enter_action == ss_config::ENTER_REVEAL;
-    let (enter, alt) = if enter_reveals { ("定位", "打开") } else { ("打开", "定位") };
     let keys = [
-        (enter, "Enter", Act::Activate(false)),
-        (alt, "Ctrl+Enter", Act::Activate(true)),
+        ("定位", "Enter / 双击", Act::Activate(false)),
+        ("打开", "Ctrl+双击", Act::Activate(true)),
         ("复制路径", "Ctrl+C", Act::CopyPath),
     ];
     let flags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
@@ -2024,7 +2022,7 @@ unsafe extern "system" fn results_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                         u.sel = idx;
                     }
                 });
-                activate_selected(false);
+                activate_selected(key_down(VK_CONTROL.0));
             }
             LRESULT(0)
         }
