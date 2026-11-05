@@ -2,13 +2,58 @@
 //! 支持磁盘缓存（秒开）与 USN 增量更新。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use crate::category::Category;
 use crate::drives::ntfs_fixed_drives;
-use crate::index::{Change, Index, ScoreKey, SearchResult};
+use crate::index::{compile_query, Change, Index, ScanSpec, ScoreKey, SearchResult};
 use crate::mft::{build_index_for_drive, current_usn_state, read_changes};
 use crate::persist;
+
+/// 搜索范围。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    Drive(char),
+    /// 只搜索该文件夹子树（完整路径）。
+    Folder(String),
+}
+
+/// 搜索范围是否有效。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeStatus {
+    Ok,
+    /// 文件夹已不存在（被删除、改名，或不在索引中）。
+    FolderMissing,
+    DriveNotIndexed,
+}
+
+/// 一次搜索请求。
+pub struct SearchRequest<'a> {
+    pub query: &'a str,
+    pub scope: Scope,
+    pub category: Category,
+    pub limit: usize,
+    /// 置为 true 后，扫描线程会尽快停止。
+    pub cancel: Option<&'a AtomicBool>,
+}
+
+/// 一次搜索的结果。
+#[derive(Debug)]
+pub struct SearchResponse {
+    pub items: Vec<SearchResult>,
+    /// 全部命中数，不受 `limit` 影响。取消时只统计已扫描的部分。
+    pub total_hits: usize,
+    /// `total_hits > items.len()`。
+    pub truncated: bool,
+    pub scope_status: ScopeStatus,
+    pub cancelled: bool,
+    pub elapsed_ms: u32,
+    /// 产生这次结果时的索引版本，见 [`Catalog::generation`]。
+    pub generation: u64,
+}
 
 /// 多个盘的索引集合。
 pub struct Catalog {
@@ -17,6 +62,7 @@ pub struct Catalog {
     /// `find_dir_by_path` 是 O(节点数 × 深度) 线性扫描，不缓存则每次击键都重跑；
     /// 命中时用 `Index::is_live_dir_at` 反查路径校验（目录被删/改名/重建即失效重解析）。
     folder_cache: Mutex<Option<(String, usize, u32)>>,
+    generation: u64,
 }
 
 fn cache_path(dir: &Path, letter: char) -> PathBuf {
@@ -28,6 +74,7 @@ impl Catalog {
         Catalog {
             indexes,
             folder_cache: Mutex::new(None),
+            generation: 0,
         }
     }
 
@@ -109,8 +156,8 @@ impl Catalog {
     pub fn apply_drive_changes(&mut self, letter: char, changes: &[Change], new_next: i64) {
         for idx in &mut self.indexes {
             if idx.drive_letter() == letter {
-                if !changes.is_empty() {
-                    idx.apply_all(changes);
+                if idx.apply_all(changes) > 0 {
+                    self.generation += 1;
                 }
                 idx.set_next_usn(new_next);
                 return;
@@ -121,17 +168,19 @@ impl Catalog {
     /// 增量追赶（供定时器周期调用），返回本次应用的变更总数。
     pub fn catch_up(&mut self) -> usize {
         let mut total = 0;
+        let mut changed = false;
         for idx in &mut self.indexes {
             let letter = idx.drive_letter();
             let jid = idx.usn_journal_id();
             let from = idx.next_usn();
             if let Ok((changes, new_next)) = read_changes(letter, jid, from) {
                 total += changes.len();
-                if !changes.is_empty() {
-                    idx.apply_all(&changes);
-                }
+                changed |= idx.apply_all(&changes) > 0;
                 idx.set_next_usn(new_next);
             }
+        }
+        if changed {
+            self.generation += 1;
         }
         total
     }
@@ -156,6 +205,7 @@ impl Catalog {
             Some(slot) => *slot = new_idx,
             None => self.indexes.push(new_idx),
         }
+        self.generation += 1;
         // 节点 id 已全部变化，文件夹解析缓存作废（校验也会拦住，这里直接清掉更省）
         *self.folder_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
@@ -204,6 +254,82 @@ impl Catalog {
         Some((di, id))
     }
 
+    /// 索引内容的版本号。只在实际应用变更或替换索引后递增，空轮询不递增。
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// 把搜索范围解析成要扫描的盘和子树根。
+    fn resolve_scope(&self, scope: &Scope) -> (ScopeStatus, Vec<(usize, Option<u32>)>) {
+        match scope {
+            Scope::All => (
+                ScopeStatus::Ok,
+                (0..self.indexes.len()).map(|di| (di, None)).collect(),
+            ),
+            Scope::Drive(letter) => match self.drive_position(*letter) {
+                Some(di) => (ScopeStatus::Ok, vec![(di, None)]),
+                None => (ScopeStatus::DriveNotIndexed, Vec::new()),
+            },
+            Scope::Folder(folder) => {
+                let indexed = folder.chars().next().and_then(|c| self.drive_position(c));
+                if indexed.is_none() {
+                    return (ScopeStatus::DriveNotIndexed, Vec::new());
+                }
+                match self.resolve_folder(folder) {
+                    Some((di, anc)) => (ScopeStatus::Ok, vec![(di, Some(anc))]),
+                    None => (ScopeStatus::FolderMissing, Vec::new()),
+                }
+            }
+        }
+    }
+
+    fn drive_position(&self, letter: char) -> Option<usize> {
+        let letter = letter.to_ascii_uppercase();
+        self.indexes.iter().position(|i| i.drive_letter() == letter)
+    }
+
+    /// 执行一次搜索：各盘全量扫描 → 全局排序 → 取前 `limit` → 只为前 `limit` 条还原字符串。
+    pub fn query(&self, req: &SearchRequest) -> SearchResponse {
+        let started = Instant::now();
+        let terms = compile_query(req.query);
+        let (scope_status, targets) = self.resolve_scope(&req.scope);
+
+        let mut merged: Vec<(ScoreKey, usize, u32)> = Vec::new();
+        let mut total_hits = 0usize;
+        let mut cancelled = false;
+        for (di, ancestor) in targets {
+            let scan = self.indexes[di].scan_sorted(&ScanSpec {
+                terms: &terms,
+                category: req.category,
+                ancestor,
+                limit: req.limit,
+                cancel: req.cancel,
+            });
+            total_hits += scan.total_hits;
+            merged.extend(scan.hits.into_iter().map(|(k, id)| (k, di, id)));
+            if scan.cancelled {
+                cancelled = true;
+                break;
+            }
+        }
+        merged.sort_unstable();
+        merged.truncate(req.limit);
+        let items: Vec<SearchResult> = merged
+            .into_iter()
+            .map(|(_, di, id)| self.indexes[di].materialize(id, &terms))
+            .collect();
+
+        SearchResponse {
+            truncated: total_hits > items.len(),
+            items,
+            total_hits,
+            scope_status,
+            cancelled,
+            elapsed_ms: started.elapsed().as_millis().min(u32::MAX as u128) as u32,
+            generation: self.generation,
+        }
+    }
+
     /// 搜索。`folder=Some(路径)` 只在该文件夹子树内搜（优先于 drive）；
     /// 否则 `drive=None` 搜全部盘、`Some(letter)` 仅该盘。`category` 按类型过滤。
     pub fn search(
@@ -214,32 +340,128 @@ impl Catalog {
         category: Category,
         limit: usize,
     ) -> Vec<SearchResult> {
-        // 文件夹子树范围
-        if let Some(folder) = folder {
-            return match self.resolve_folder(folder) {
-                Some((di, anc)) => self.indexes[di].search_under(query, category, anc, limit),
-                None => Vec::new(),
-            };
-        }
+        let scope = match (folder, drive) {
+            (Some(f), _) => Scope::Folder(f.to_string()),
+            (None, Some(d)) => Scope::Drive(d),
+            (None, None) => Scope::All,
+        };
+        self.query(&SearchRequest {
+            query,
+            scope,
+            category,
+            limit,
+            cancel: None,
+        })
+        .items
+    }
+}
 
-        // 多盘：各盘收集已排序候选 → 全局排序 → 取前 limit → 仅前 limit 还原字符串。
-        let want = drive.map(|d| d.to_ascii_uppercase());
-        let mut merged: Vec<(ScoreKey, usize, u32)> = Vec::new();
-        for (di, idx) in self.indexes.iter().enumerate() {
-            if let Some(d) = want {
-                if idx.drive_letter() != d {
-                    continue;
-                }
-            }
-            for (k, id) in idx.collect_sorted(query, category, None, limit) {
-                merged.push((k, di, id));
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::IndexBuilder;
+
+    const DIR: u32 = 0x10;
+
+    fn sample_catalog() -> Catalog {
+        let mut c = IndexBuilder::new(b'C');
+        c.push(100, 5, DIR, "Users");
+        c.push(200, 100, 0, "report.txt");
+        let mut d = IndexBuilder::new(b'D');
+        d.push(100, 5, DIR, "Work");
+        d.push(200, 100, 0, "report_d.txt");
+        Catalog::from_indexes(vec![c.finish(), d.finish()])
+    }
+
+    fn req(query: &str, scope: Scope) -> SearchRequest<'_> {
+        SearchRequest {
+            query,
+            scope,
+            category: Category::All,
+            limit: 10,
+            cancel: None,
         }
-        merged.sort_unstable();
-        merged.truncate(limit);
-        merged
-            .into_iter()
-            .map(|(_, di, id)| self.indexes[di].materialize(id))
-            .collect()
+    }
+
+    #[test]
+    fn query_reports_hits_and_truncation() {
+        let cat = sample_catalog();
+        let mut r = req("report", Scope::All);
+        let all = cat.query(&r);
+        assert_eq!((all.total_hits, all.items.len()), (2, 2));
+        assert!(!all.truncated);
+        assert_eq!(all.scope_status, ScopeStatus::Ok);
+        r.limit = 1;
+        let one = cat.query(&r);
+        assert_eq!((one.total_hits, one.items.len()), (2, 1));
+        assert!(one.truncated);
+
+        let d = cat.query(&req("report", Scope::Drive('d')));
+        assert_eq!(d.items[0].path, "D:\\Work\\report_d.txt");
+        assert_eq!(d.total_hits, 1);
+    }
+
+    #[test]
+    fn query_reports_scope_status() {
+        let cat = sample_catalog();
+        let ok = cat.query(&req("report", Scope::Folder("C:\\Users".into())));
+        assert_eq!(ok.scope_status, ScopeStatus::Ok);
+        assert_eq!(ok.items.len(), 1);
+
+        let missing = cat.query(&req("report", Scope::Folder("C:\\Gone".into())));
+        assert_eq!(missing.scope_status, ScopeStatus::FolderMissing);
+        assert!(missing.items.is_empty());
+
+        let drive = cat.query(&req("report", Scope::Drive('E')));
+        assert_eq!(drive.scope_status, ScopeStatus::DriveNotIndexed);
+        let folder = cat.query(&req("report", Scope::Folder("E:\\x".into())));
+        assert_eq!(folder.scope_status, ScopeStatus::DriveNotIndexed);
+    }
+
+    #[test]
+    fn query_stops_when_cancelled() {
+        let cat = sample_catalog();
+        let cancel = AtomicBool::new(true);
+        let mut r = req("report", Scope::All);
+        r.cancel = Some(&cancel);
+        let resp = cat.query(&r);
+        assert!(resp.cancelled);
+        assert!(resp.items.is_empty());
+
+        cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        let resp = cat.query(&r);
+        assert!(!resp.cancelled);
+        assert_eq!(resp.items.len(), 2);
+    }
+
+    #[test]
+    fn generation_increases_only_on_real_changes() {
+        let mut cat = sample_catalog();
+        let g0 = cat.generation();
+        // 空轮询和不改变内容的变更都不递增，但 USN 位点仍然前进
+        cat.apply_drive_changes('C', &[], 42);
+        let same = Change::Upsert { frn: 200, parent_frn: 100, attrs: 0, name: "report.txt".into() };
+        cat.apply_drive_changes('C', &[same], 43);
+        assert_eq!(cat.generation(), g0);
+        assert_eq!(cat.usn_positions()[0].2, 43);
+
+        let new = Change::Upsert { frn: 300, parent_frn: 100, attrs: 0, name: "new.txt".into() };
+        cat.apply_drive_changes('C', &[new], 44);
+        assert_eq!(cat.generation(), g0 + 1);
+
+        cat.replace_index(IndexBuilder::new(b'D').finish());
+        assert_eq!(cat.generation(), g0 + 2);
+        assert_eq!(cat.query(&req("new", Scope::All)).generation, g0 + 2);
+    }
+
+    #[test]
+    fn legacy_search_uses_same_scopes() {
+        let cat = sample_catalog();
+        assert_eq!(cat.search("report", None, None, Category::All, 10).len(), 2);
+        assert_eq!(cat.search("report", Some('C'), None, Category::All, 10).len(), 1);
+        // folder 优先于 drive
+        let r = cat.search("report", Some('C'), Some("D:\\Work"), Category::All, 10);
+        assert_eq!(r[0].path, "D:\\Work\\report_d.txt");
+        assert!(cat.search("", None, None, Category::All, 10).is_empty());
     }
 }

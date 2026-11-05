@@ -10,6 +10,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use crate::category::Category;
 
@@ -48,6 +49,8 @@ pub struct SearchResult {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
+    /// 命中部分在 `name` 中的字节区间，已排序且互不重叠。
+    pub match_ranges: Vec<(u16, u16)>,
 }
 
 /// USN 增量变更。
@@ -65,13 +68,19 @@ pub enum Change {
 }
 
 /// ASCII 大小写不敏感子串匹配。`needle` 必须已小写。
-/// 首字节用 memchr（SIMD）同时找大小写两种形态，命中后再逐字节核对余下部分。
+#[inline]
 fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    find_ci(hay, needle).is_some()
+}
+
+/// 返回 `needle` 首次出现的位置。`needle` 必须已小写。
+/// 首字节用 memchr（SIMD）同时找大小写两种形态，命中后再逐字节核对余下部分。
+fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
-        return true;
+        return Some(0);
     }
     if hay.len() < needle.len() {
-        return false;
+        return None;
     }
     let lower = needle[0];
     let upper = lower.to_ascii_uppercase();
@@ -85,20 +94,18 @@ fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
         } else {
             memchr::memchr2(lower, upper, window)
         };
-        let Some(i) = hit else {
-            return false;
-        };
+        let i = hit?;
         let s = pos + i;
         if hay[s + 1..s + needle.len()].eq_ignore_ascii_case(rest) {
-            return true;
+            return Some(s);
         }
         pos = s + 1;
     }
-    false
+    None
 }
 
 /// 一个查询词：已折叠小写的字节 + 是否含通配符（`*`/`?`）。
-struct CompiledTerm {
+pub(crate) struct CompiledTerm {
     lower: Vec<u8>,
     has_wild: bool,
     /// 以 `*` 开头且不以 `*` 结尾：要求匹配到名字结尾（`*.txt` 不匹配 `a.txt.bak`）。
@@ -107,7 +114,7 @@ struct CompiledTerm {
 
 /// 把原始查询编译为词列表：按 Unicode 空白分词（含全角空格 U+3000），每词预折叠小写
 /// 并标记通配符。空白不产生空词；空查询返回空 Vec。
-fn compile_query(query: &str) -> Vec<CompiledTerm> {
+pub(crate) fn compile_query(query: &str) -> Vec<CompiledTerm> {
     query
         .split_whitespace()
         .map(|w| {
@@ -215,6 +222,72 @@ fn glob_at(h: &[u8], pat: &[u8], anchor_end: bool) -> bool {
     }
 }
 
+/// 一段不含 `*` 的模式是否能从 `h` 开头匹配，返回匹配的字节数。
+fn segment_len_at(h: &[u8], seg: &[u8]) -> Option<usize> {
+    let mut hi = 0usize;
+    for &c in seg {
+        if hi >= h.len() {
+            return None;
+        }
+        if c == b'?' {
+            hi = (hi + utf8_char_len(h[hi])).min(h.len());
+        } else if h[hi].to_ascii_lowercase() == c {
+            hi += 1;
+        } else {
+            return None;
+        }
+    }
+    Some(hi)
+}
+
+/// 通配模式的命中区间：把模式按 `*` 拆段，从左到右为每段找最早的位置。这样高亮的是字面
+/// 部分（`*.txt` 只高亮 `.txt`），而不是 `*` 吞掉的内容。`anchor_end` 时最后一段对齐结尾。
+fn wildcard_ranges(hay: &[u8], t: &CompiledTerm, out: &mut Vec<(u16, u16)>) {
+    let segs: Vec<&[u8]> = t.lower.split(|&b| b == b'*').filter(|s| !s.is_empty()).collect();
+    let last = segs.len().wrapping_sub(1);
+    let mut cursor = 0usize;
+    for (i, seg) in segs.iter().enumerate() {
+        let found = if t.anchor_end && i == last {
+            // 从右往左找能恰好匹配到结尾的起点（段里可能有多字节字符和 `?`）
+            (cursor..hay.len())
+                .rev()
+                .filter(|&s| !is_utf8_continuation(hay[s]))
+                .find(|&s| segment_len_at(&hay[s..], seg) == Some(hay.len() - s))
+                .map(|s| (s, hay.len()))
+        } else {
+            (cursor..hay.len())
+                .filter(|&s| !is_utf8_continuation(hay[s]))
+                .find_map(|s| segment_len_at(&hay[s..], seg).map(|len| (s, s + len)))
+        };
+        let Some((start, end)) = found else {
+            return;
+        };
+        out.push((start as u16, end as u16));
+        cursor = end;
+    }
+}
+
+/// 计算 `name` 上所有词的命中区间，合并成有序且互不重叠的列表。只为最终结果调用。
+fn match_ranges(name: &[u8], terms: &[CompiledTerm]) -> Vec<(u16, u16)> {
+    let mut ranges: Vec<(u16, u16)> = Vec::new();
+    for t in terms {
+        if t.has_wild {
+            wildcard_ranges(name, t, &mut ranges);
+        } else if let Some(s) = find_ci(name, &t.lower) {
+            ranges.push((s as u16, (s + t.lower.len()) as u16));
+        }
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u16, u16)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
+}
+
 /// 搜索结果排序键。派生 `Ord` 按字段先后、各字段升序比较，`bool` 的 `false < true`，
 /// 故命中项一律用否定语义（`not_*`，命中 = `false` 排在前）。
 /// 顺序：完全匹配 > 主名完全匹配（`report` 命中 `report.pdf`）> 前缀匹配 > 目录 >
@@ -249,11 +322,26 @@ impl ScoreKey {
     }
 }
 
-/// 一次扫描的结果：最好的若干条（未排序）和全部命中数。
+/// 一次扫描的条件。
+#[derive(Clone, Copy)]
+pub(crate) struct ScanSpec<'a> {
+    pub terms: &'a [CompiledTerm],
+    pub category: Category,
+    /// 只取该目录子树内的节点。
+    pub ancestor: Option<u32>,
+    pub limit: usize,
+    pub cancel: Option<&'a AtomicBool>,
+}
+
+/// 每扫描这么多节点检查一次取消标记。
+const CANCEL_CHECK_MASK: u32 = 4096 - 1;
+
+/// 一次扫描的结果：最好的若干条和全部命中数。取消时只包含已扫描到的部分。
 #[derive(Default)]
-struct Scan {
-    hits: Vec<(ScoreKey, u32)>,
-    total_hits: usize,
+pub(crate) struct Scan {
+    pub hits: Vec<(ScoreKey, u32)>,
+    pub total_hits: usize,
+    pub cancelled: bool,
 }
 
 /// `name` 是否以 `lower`（已小写）开头，ASCII 大小写不敏感。
@@ -554,20 +642,26 @@ impl Index {
 
     /// 在 id 区间 `[lo, hi)` 内做全量扫描：统计全部命中数，只保留最好的 `limit` 条。
     /// 比堆顶差的命中不计算深度、不分配小写名，所以泛查询的开销主要在名字匹配上。
-    fn collect_range(
-        &self,
-        lo: u32,
-        hi: u32,
-        terms: &[CompiledTerm],
-        category: Category,
-        ancestor: Option<u32>,
-        limit: usize,
-    ) -> Scan {
+    fn collect_range(&self, lo: u32, hi: u32, spec: &ScanSpec) -> Scan {
+        let ScanSpec {
+            terms,
+            category,
+            ancestor,
+            limit,
+            cancel,
+        } = *spec;
         let mut heap: BinaryHeap<(ScoreKey, u32)> = BinaryHeap::new();
         let mut total_hits = 0usize;
+        let mut cancelled = false;
         // 只有「单词且无通配」才可能构成完全/前缀匹配（多词或含通配恒不算）。
         let single_plain = terms.len() == 1 && !terms[0].has_wild;
         for id in lo..hi {
+            if (id - lo) & CANCEL_CHECK_MASK == 0
+                && cancel.is_some_and(|c| c.load(AtomicOrdering::Relaxed))
+            {
+                cancelled = true;
+                break;
+            }
             if self.is_deleted(id) {
                 continue;
             }
@@ -627,19 +721,14 @@ impl Index {
         Scan {
             hits: heap.into_vec(),
             total_hits,
+            cancelled,
         }
     }
 
     /// 全量扫描。大索引按 id 区间切成多段并行（作用域线程，每次搜索建/收线程约几十微秒，
     /// 远小于扫描本身），每段独立保留前 `limit` 条。全局前 `limit` 条一定在各段前
-    /// `limit` 条的并集里。`terms` 须非空（由调用方保证）。`ancestor=Some` 时只取该子树。
-    fn collect_scored(
-        &self,
-        terms: &[CompiledTerm],
-        category: Category,
-        ancestor: Option<u32>,
-        limit: usize,
-    ) -> Scan {
+    /// `limit` 条的并集里。`terms` 须非空（由调用方保证）。
+    fn collect_scored(&self, spec: &ScanSpec) -> Scan {
         let n = self.names_len.len();
         let threads = if n >= PAR_MIN_NODES {
             std::thread::available_parallelism()
@@ -650,7 +739,7 @@ impl Index {
             1
         };
         if threads <= 1 || n < 2 {
-            return self.collect_range(1, n as u32, terms, category, ancestor, limit);
+            return self.collect_range(1, n as u32, spec);
         }
         let chunk = n.div_ceil(threads);
         std::thread::scope(|s| {
@@ -658,7 +747,7 @@ impl Index {
                 .map(|t| {
                     let lo = (t * chunk).max(1).min(n) as u32;
                     let hi = ((t + 1) * chunk).min(n) as u32;
-                    s.spawn(move || self.collect_range(lo, hi, terms, category, ancestor, limit))
+                    s.spawn(move || self.collect_range(lo, hi, spec))
                 })
                 .collect();
             let mut out = Scan::default();
@@ -666,17 +755,19 @@ impl Index {
                 let part = h.join().unwrap_or_default();
                 out.hits.extend(part.hits);
                 out.total_hits += part.total_hits;
+                out.cancelled |= part.cancelled;
             }
             out
         })
     }
 
-    /// 由 id 还原一条搜索结果（建 name/path 字符串）。
-    pub(crate) fn materialize(&self, id: u32) -> SearchResult {
+    /// 由 id 还原一条搜索结果（建 name/path 字符串，计算命中区间）。
+    pub(crate) fn materialize(&self, id: u32, terms: &[CompiledTerm]) -> SearchResult {
         SearchResult {
             name: self.name(id),
             path: self.path(id),
             is_dir: self.is_dir(id),
+            match_ranges: match_ranges(self.name_bytes(id), terms),
         }
     }
 
@@ -689,28 +780,30 @@ impl Index {
         ancestor: Option<u32>,
         limit: usize,
     ) -> Vec<SearchResult> {
-        let mut c = self.collect_sorted(query, category, ancestor, limit);
-        c.truncate(limit);
-        c.into_iter().map(|(_, id)| self.materialize(id)).collect()
+        let terms = compile_query(query);
+        let scan = self.scan_sorted(&ScanSpec {
+            terms: &terms,
+            category,
+            ancestor,
+            limit,
+            cancel: None,
+        });
+        scan.hits
+            .into_iter()
+            .map(|(_, id)| self.materialize(id, &terms))
+            .collect()
     }
 
-    /// 供多盘合并：返回单盘已排序并截到 `limit` 的 `(键, id)`，不还原字符串。
-    /// 全局 top-limit ⊆ 各盘 top-limit 的并集，故先截可减少合并量。
-    pub(crate) fn collect_sorted(
-        &self,
-        query: &str,
-        category: Category,
-        ancestor: Option<u32>,
-        limit: usize,
-    ) -> Vec<(ScoreKey, u32)> {
-        let terms = compile_query(query);
-        if terms.is_empty() {
-            return Vec::new();
+    /// 供多盘合并：返回单盘已排序并截到 `limit` 的结果，不还原字符串。
+    /// 全局 top-limit ⊆ 各盘 top-limit 的并集，故先截可减少合并量。空查询返回空。
+    pub(crate) fn scan_sorted(&self, spec: &ScanSpec) -> Scan {
+        if spec.terms.is_empty() {
+            return Scan::default();
         }
-        let mut c = self.collect_scored(&terms, category, ancestor, limit).hits;
-        c.sort_unstable();
-        c.truncate(limit);
-        c
+        let mut scan = self.collect_scored(spec);
+        scan.hits.sort_unstable();
+        scan.hits.truncate(spec.limit);
+        scan
     }
 
     pub fn search(&self, query: &str, category: Category, limit: usize) -> Vec<SearchResult> {
@@ -829,8 +922,8 @@ impl Index {
         id
     }
 
-    /// 应用一条增量变更。
-    pub fn apply(&mut self, change: &Change) {
+    /// 应用一条增量变更，返回索引内容是否真的变化。
+    pub fn apply(&mut self, change: &Change) -> bool {
         match change {
             Change::Delete { frn } => {
                 let rec = frn_rec(*frn);
@@ -839,8 +932,10 @@ impl Index {
                     if id != NO_ID && self.seq[id as usize] == frn_seq(*frn) {
                         self.tombstone(id);
                         self.rec_to_id[rec] = NO_ID;
+                        return true;
                     }
                 }
+                false
             }
             Change::Upsert {
                 frn,
@@ -849,11 +944,11 @@ impl Index {
                 name,
             } => {
                 if IndexBuilder::is_root_frn(*frn) {
-                    return;
+                    return false;
                 }
                 let rec = frn_rec(*frn);
                 if rec >= MAX_RECORDS {
-                    return;
+                    return false;
                 }
                 let seq = frn_seq(*frn);
                 let parent_id = self.resolve_parent(*parent_frn);
@@ -861,9 +956,18 @@ impl Index {
                 let existing = self.rec_to_id.get(rec).copied().filter(|&id| id != NO_ID);
                 match existing {
                     Some(id) if self.seq[id as usize] == seq => {
+                        let flags = if is_dir { IS_DIR } else { 0 };
+                        let i = id as usize;
+                        if self.name_bytes(id) == name.as_bytes()
+                            && self.parent[i] == parent_id
+                            && self.flags[i] == flags
+                        {
+                            return false;
+                        }
                         self.set_name(id, name);
-                        self.parent[id as usize] = parent_id;
-                        self.flags[id as usize] = if is_dir { IS_DIR } else { 0 };
+                        self.parent[i] = parent_id;
+                        self.flags[i] = flags;
+                        true
                     }
                     other => {
                         // 记录号被新文件复用（序列号不同）= 旧文件的 Delete 事件丢失：
@@ -878,16 +982,16 @@ impl Index {
                             self.rec_to_id.resize(rec + 1, NO_ID);
                         }
                         self.rec_to_id[rec] = id;
+                        true
                     }
                 }
             }
         }
     }
 
-    pub fn apply_all(&mut self, changes: &[Change]) {
-        for c in changes {
-            self.apply(c);
-        }
+    /// 应用一批变更，返回真正改变索引内容的条数。
+    pub fn apply_all(&mut self, changes: &[Change]) -> usize {
+        changes.iter().filter(|c| self.apply(c)).count()
     }
 }
 
@@ -1197,6 +1301,50 @@ mod tests {
         assert!(!idx.needs_rebuild());
     }
 
+    fn spec(terms: &[CompiledTerm], limit: usize) -> ScanSpec<'_> {
+        ScanSpec {
+            terms,
+            category: Category::All,
+            ancestor: None,
+            limit,
+            cancel: None,
+        }
+    }
+
+    #[test]
+    fn match_ranges_cover_terms_in_name_bytes() {
+        let ranges = |name: &str, q: &str| match_ranges(name.as_bytes(), &compile_query(q));
+        assert_eq!(ranges("Report.TXT", "report"), [(0, 6)]);
+        assert_eq!(ranges("Report.TXT", "txt rep"), [(0, 3), (7, 10)]);
+        // 相邻和重叠的区间会合并
+        assert_eq!(ranges("abcdef", "abc cde"), [(0, 5)]);
+        // 汉字占 3 字节
+        assert_eq!(ranges("年度报告.pdf", "报告"), [(6, 12)]);
+        // 通配符只高亮字面部分，? 算进区间
+        assert_eq!(ranges("a.txt.txt", "*.txt"), [(5, 9)]);
+        assert_eq!(ranges("报告.txt", "报?.t*"), [(0, 8)]);
+        assert_eq!(ranges("rep_x_final.txt", "rep*final"), [(0, 3), (6, 11)]);
+
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, 0, "报告.txt");
+        let idx = b.finish();
+        assert_eq!(idx.search("告", Category::All, 1)[0].match_ranges, [(3, 6)]);
+    }
+
+    #[test]
+    fn apply_reports_whether_index_changed() {
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, 0, "a.txt");
+        let mut idx = b.finish();
+        let same = Change::Upsert { frn: 100, parent_frn: 5, attrs: 0, name: "a.txt".into() };
+        assert!(!idx.apply(&same));
+        assert!(idx.apply(&Change::Upsert { frn: 100, parent_frn: 5, attrs: 0, name: "b.txt".into() }));
+        assert!(idx.apply(&Change::Upsert { frn: 200, parent_frn: 5, attrs: 0, name: "c.txt".into() }));
+        assert!(!idx.apply(&Change::Delete { frn: 999 }));
+        assert!(idx.apply(&Change::Delete { frn: 200 }));
+        assert!(!idx.apply(&Change::Delete { frn: 200 }));
+    }
+
     #[test]
     fn exact_match_after_many_hits_ranks_first() {
         // 旧实现命中 4000 条就停止扫描，排在后面的完全匹配会丢失。
@@ -1219,16 +1367,16 @@ mod tests {
         }
         let idx = b.finish();
         let terms = compile_query("x");
-        let scan = idx.collect_scored(&terms, Category::All, None, 10);
+        let scan = idx.collect_scored(&spec(&terms, 10));
         assert_eq!(scan.hits.len(), 10);
         assert_eq!(scan.total_hits, 30);
         // 完全相同的键按 id 决定先后，保留最小的 10 个 id
         let mut ids: Vec<u32> = scan.hits.iter().map(|(_, id)| *id).collect();
         ids.sort_unstable();
         assert_eq!(ids, (1..=10).collect::<Vec<u32>>());
-        let scan = idx.collect_scored(&terms, Category::All, None, 100);
+        let scan = idx.collect_scored(&spec(&terms, 100));
         assert_eq!(scan.hits.len(), 30);
-        assert_eq!(idx.collect_scored(&terms, Category::All, None, 0).total_hits, 30);
+        assert_eq!(idx.collect_scored(&spec(&terms, 0)).total_hits, 30);
     }
 
     #[test]
@@ -1243,8 +1391,8 @@ mod tests {
         }
         let idx = b.finish();
         let terms = compile_query("hit");
-        let par = idx.collect_scored(&terms, Category::All, None, 1_000_000);
-        let single = idx.collect_range(1, idx.len() as u32, &terms, Category::All, None, 1_000_000);
+        let par = idx.collect_scored(&spec(&terms, 1_000_000));
+        let single = idx.collect_range(1, idx.len() as u32, &spec(&terms, 1_000_000));
         assert_eq!(par.total_hits, single.total_hits);
         let mut a: Vec<u32> = par.hits.into_iter().map(|(_, id)| id).collect();
         let mut c: Vec<u32> = single.hits.into_iter().map(|(_, id)| id).collect();
@@ -1254,8 +1402,8 @@ mod tests {
         assert_eq!(a.len(), (n as usize).div_ceil(997));
 
         // 只保留前几条时，多线程和单线程的结果和顺序也一致
-        let mut par = idx.collect_scored(&terms, Category::All, None, 50).hits;
-        let mut single = idx.collect_range(1, idx.len() as u32, &terms, Category::All, None, 50).hits;
+        let mut par = idx.collect_scored(&spec(&terms, 50)).hits;
+        let mut single = idx.collect_range(1, idx.len() as u32, &spec(&terms, 50)).hits;
         par.sort_unstable();
         par.truncate(50);
         single.sort_unstable();

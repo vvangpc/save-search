@@ -10,7 +10,7 @@ mod index;
 mod mft;
 mod persist;
 
-pub use catalog::Catalog;
+pub use catalog::{Catalog, Scope, ScopeStatus, SearchRequest, SearchResponse};
 pub use category::{classify, Category};
 pub use drives::ntfs_fixed_drives;
 pub use index::{Change, Index, IndexBuilder, SearchResult, IS_DIR, ROOT_ID};
