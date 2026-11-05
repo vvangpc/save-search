@@ -13,7 +13,8 @@ use parking_lot::{Mutex, RwLock};
 use ss_core::{Catalog, Category, CategoryCounts, DriveState, Scope, ScopeStatus, SearchResult};
 use ss_ui_model::{
     all_drives_label, banner, body, compact, ease_toward, enter_op, highlight_segments,
-    is_partial_selection, moved, parent_of, reselect, scope_index, scope_key, status_line, Banner,
+    is_partial_selection, leaf_of, moved, parent_of, reselect, scope_index, scope_key, status_line,
+    Banner,
     Body, BuildProgress, DriveFailure, ListGeometry, OpenOp, RequestSeq, ScopeProblem, SelMove,
     ViewInput,
 };
@@ -676,14 +677,6 @@ fn selected_scope(combo: HWND) -> (Option<char>, Option<String>) {
             (None, ui.presets.get(pi).cloned())
         }
     })
-}
-
-fn leaf_of(path: &str) -> &str {
-    let p = path.trim_end_matches('\\');
-    match p.rfind('\\') {
-        Some(i) => &p[i + 1..],
-        None => p,
-    }
 }
 
 /// 空输入页的行：最近位置和收藏，按路径去重。

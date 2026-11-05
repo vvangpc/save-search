@@ -1,18 +1,32 @@
-//! 保存/打开对话框下方的浮窗：自绘双行（文件夹图标 + 名称 + 灰色路径 + 收藏/最近标记）。
+//! 保存/打开对话框下方的浮窗：自绘双行（文件夹图标 + 文件夹名 + 灰色父路径 + 来源标记）。
 //!
 //! 无边框置顶、`WS_EX_NOACTIVATE`（点击不抢对话框焦点）。单击导航且保留浮窗，对话框关闭才消失。
+//!
+//! 收藏和最近位置立即显示。已打开的文件夹和路径是否存在在后台线程读取，
+//! 这样 Explorer 无响应或网络路径卡住时，浮窗仍能显示。
 
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use ss_shell::NavError;
+use ss_ui_model::{
+    initial_entries, leaf_of, mark_dead, merge_open, parent_of, without_loading, EntrySource,
+    PopupEntry,
+};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DrawTextW, FillRect, GetMonitorInfoW, MonitorFromWindow, SelectObject, SetBkMode,
-    SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DRAW_TEXT_FORMAT,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HDC, HFONT,
-    HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, TRANSPARENT,
+    BeginPaint, CreateFontW, DrawTextW, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect,
+    MonitorFromWindow,
+    ScreenToClient, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DRAW_TEXT_FORMAT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_PATH_ELLIPSIS,
+    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, HGDIOBJ, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECTED};
@@ -20,18 +34,19 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::{icons, theme};
 
-/// 浮窗条目来源（决定右侧标记）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntryKind {
-    Favorite,
-    Open,
-    Recent,
-}
+const WM_APP_OPEN_FOLDERS: u32 = WM_APP + 20;
+const WM_APP_DEAD_PATHS: u32 = WM_APP + 21;
+const LOADING_TIMER: usize = 1;
+/// 读取已打开文件夹超过这个时间就不再显示“正在读取”。
+const LOADING_TIMEOUT_MS: u32 = 3000;
+/// 同一时间只运行一个读取线程。Explorer 卡住时不会不断创建新线程。
+static READER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 const LIST_ID: u32 = 201;
 const LBN_SELCHANGE: u32 = 1;
 const IDM_FAV: u32 = 1;
 const LB_SETITEMHEIGHT: u32 = 0x01A0;
+const LB_ITEMFROMPOINT: u32 = 0x01A9;
 
 mod st {
     pub const WS_POPUP: u32 = 0x8000_0000;
@@ -51,9 +66,14 @@ struct Popup {
     hwnd: HWND,
     list: HWND,
     dialog: HWND,
-    entries: Vec<(EntryKind, String)>,
+    entries: Vec<PopupEntry>,
+    /// 上次读到的已打开文件夹，下次显示时先用它，避免列表跳动。
+    open_cache: Vec<String>,
+    /// 跳转失败的提示，显示在列表上方。
+    notice: Option<String>,
     font_name: HFONT,
     font_path: HFONT,
+    font_icon: HFONT,
     item_h: i32,
     dpi: i32,
 }
@@ -66,10 +86,10 @@ fn send(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
     unsafe { SendMessageW(hwnd, msg, Some(WPARAM(w)), Some(LPARAM(l))).0 }
 }
 
-unsafe fn make_font(px: i32, weight: i32) -> HFONT {
+unsafe fn make_font(px: i32, weight: i32, face: PCWSTR) -> HFONT {
     CreateFontW(
         -px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, 0, w!("Segoe UI"),
+        CLEARTYPE_QUALITY, 0, face,
     )
 }
 
@@ -129,8 +149,9 @@ pub fn init() -> windows::core::Result<()> {
         )?;
 
         let dpi = GetDpiForWindow(hwnd).max(96) as i32;
-        let font_name = make_font(dpi * 14 / 96, 600);
-        let font_path = make_font(dpi * 11 / 96, 400);
+        let font_name = make_font(dpi * 14 / 96, 600, w!("Segoe UI"));
+        let font_path = make_font(dpi * 11 / 96, 400, w!("Segoe UI"));
+        let font_icon = make_font(dpi * 13 / 96, 400, w!("Segoe MDL2 Assets"));
 
         POPUP.with(|c| {
             *c.borrow_mut() = Some(Popup {
@@ -138,8 +159,11 @@ pub fn init() -> windows::core::Result<()> {
                 list,
                 dialog: HWND(std::ptr::null_mut()),
                 entries: Vec::new(),
+                open_cache: Vec::new(),
+                notice: None,
                 font_name,
                 font_path,
+                font_icon,
                 item_h: dpi * 40 / 96,
                 dpi,
             });
@@ -157,38 +181,152 @@ fn popup_handles() -> Option<(HWND, HWND)> {
     POPUP.with(|c| c.borrow().as_ref().map(|p| (p.hwnd, p.list)))
 }
 
-/// 在 `dialog` 下方显示浮窗。`entries` 为 (来源, 路径)。
-pub fn show_for(dialog: HWND, entries: Vec<(EntryKind, String)>) {
+/// 把条目放进列表。内容没有变化时不重灌，保留选中和滚动位置，也不闪烁。
+fn set_entries(entries: Vec<PopupEntry>) {
+    let Some((_, list)) = popup_handles() else {
+        return;
+    };
+    let changed = POPUP.with(|c| {
+        let mut b = c.borrow_mut();
+        let Some(p) = b.as_mut() else {
+            return false;
+        };
+        if p.entries == entries {
+            return false;
+        }
+        p.entries = entries;
+        true
+    });
+    if !changed {
+        return;
+    }
+    let count = POPUP.with(|c| c.borrow().as_ref().map_or(0, |p| p.entries.len()));
+    let top = send(list, LB_GETTOPINDEX, 0, 0);
+    let sel = send(list, LB_GETCURSEL, 0, 0);
+    send(list, WM_SETREDRAW, 0, 0);
+    send(list, LB_RESETCONTENT, 0, 0);
+    for _ in 0..count {
+        send(list, LB_ADDSTRING, 0, 0);
+    }
+    if sel >= 0 && (sel as usize) < count {
+        send(list, LB_SETCURSEL, sel as usize, 0);
+    }
+    send(list, LB_SETTOPINDEX, top.max(0) as usize, 0);
+    send(list, WM_SETREDRAW, 1, 0);
+    let _ = unsafe { InvalidateRect(Some(list), None, true) };
+}
+
+/// 在 `dialog` 下方显示浮窗。收藏和最近位置立即显示，其余内容在后台读取。
+pub fn show_for(dialog: HWND) {
+    let Some((hwnd, list)) = popup_handles() else {
+        return;
+    };
+    let s = ss_config::load_settings();
+    let (same_dialog, open_cache, old_entries) = POPUP.with(|c| {
+        c.borrow().as_ref().map_or((false, Vec::new(), Vec::new()), |p| {
+            (p.dialog == dialog, p.open_cache.clone(), p.entries.clone())
+        })
+    });
+    let favorites = if s.popup_show_favorites { ss_config::favorites() } else { Vec::new() };
+    let recent = if s.popup_show_recent { ss_config::recent() } else { Vec::new() };
+    let open = if s.popup_show_open { open_cache } else { Vec::new() };
+    let started = start_reader(hwnd, s.popup_show_open, &favorites, &recent);
+    // 只有这个对话框第一次显示时才出现“正在读取”，来回切换前台不闪烁
+    let loading = started && s.popup_show_open && !same_dialog;
+    let mut entries = initial_entries(&favorites, &recent, &open, loading);
+    let dead: Vec<String> = old_entries.iter().filter(|e| e.dead).map(|e| e.path.clone()).collect();
+    mark_dead(&mut entries, &dead);
     if entries.is_empty() {
         hide();
         return;
     }
-    let Some((hwnd, list)) = popup_handles() else {
-        return;
-    };
-    // 同一对话框且条目未变：跳过重灌列表——保留选中与滚动位置、避免闪烁
-    // （前台来回切换时 FOREGROUND 分支会反复调用本函数，条目多数时候没变）
-    let unchanged = POPUP.with(|c| {
-        c.borrow()
-            .as_ref()
-            .map(|p| p.dialog == dialog && p.entries == entries)
-            .unwrap_or(false)
-    });
-    if !unchanged {
-        send(list, LB_RESETCONTENT, 0, 0);
-        for _ in 0..entries.len() {
-            send(list, LB_ADDSTRING, 0, 0);
-        }
-        POPUP.with(|c| {
-            if let Some(p) = c.borrow_mut().as_mut() {
-                p.dialog = dialog;
-                p.entries = entries;
+    POPUP.with(|c| {
+        if let Some(p) = c.borrow_mut().as_mut() {
+            p.dialog = dialog;
+            if !same_dialog {
+                p.notice = None;
             }
-        });
-    }
+        }
+    });
+    set_entries(entries);
     reposition(dialog, hwnd, list);
     unsafe {
+        if loading {
+            SetTimer(Some(hwnd), LOADING_TIMER, LOADING_TIMEOUT_MS, None);
+        }
         let _ = ShowWindow(hwnd, SW_SHOWNA);
+    }
+}
+
+/// 把 `Vec<String>` 发回界面线程。发送失败时回收。
+fn post_paths(hwnd: isize, msg: u32, paths: Vec<String>) {
+    let raw = Box::into_raw(Box::new(paths));
+    let target = HWND(hwnd as *mut c_void);
+    let posted = unsafe { PostMessageW(Some(target), msg, WPARAM(0), LPARAM(raw as isize)) };
+    if posted.is_err() {
+        drop(unsafe { Box::from_raw(raw) });
+    }
+}
+
+/// 启动后台读取。已有读取在进行时返回 false。
+fn start_reader(hwnd: HWND, read_open: bool, favorites: &[String], recent: &[String]) -> bool {
+    if READER_RUNNING.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let hwnd_raw = hwnd.0 as isize;
+    let mut check: Vec<String> = favorites.iter().chain(recent).cloned().collect();
+    std::thread::spawn(move || {
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if read_open {
+            let open: Vec<String> = ss_shell::enumerate_open_folders_by_z_order()
+                .into_iter()
+                .map(|f| f.path)
+                .collect();
+            check.extend(open.iter().cloned());
+            post_paths(hwnd_raw, WM_APP_OPEN_FOLDERS, open);
+        }
+        // 网络路径可能很慢，放在最后，不影响已打开文件夹的显示
+        let dead: Vec<String> = check.into_iter().filter(|p| !Path::new(p).exists()).collect();
+        post_paths(hwnd_raw, WM_APP_DEAD_PATHS, dead);
+        READER_RUNNING.store(false, Ordering::Release);
+    });
+    true
+}
+
+fn on_open_folders(open: Vec<String>) {
+    let merged = POPUP.with(|c| {
+        c.borrow_mut().as_mut().map(|p| {
+            p.open_cache = open.clone();
+            merge_open(&p.entries, &open)
+        })
+    });
+    let Some(merged) = merged else {
+        return;
+    };
+    set_entries(merged);
+    relayout();
+}
+
+fn on_dead_paths(dead: Vec<String>) {
+    let updated = POPUP.with(|c| {
+        c.borrow().as_ref().map(|p| {
+            let mut e = p.entries.clone();
+            mark_dead(&mut e, &dead);
+            e
+        })
+    });
+    if let Some(updated) = updated {
+        set_entries(updated);
+    }
+}
+
+/// 条目数量或提示变化后重新计算位置和大小。
+fn relayout() {
+    let Some(dialog) = current_dialog() else {
+        return;
+    };
+    if let Some((hwnd, list)) = popup_handles() {
+        reposition(dialog, hwnd, list);
     }
 }
 
@@ -201,7 +339,10 @@ fn reposition(dialog: HWND, hwnd: HWND, list: HWND) {
         let count = send(list, LB_GETCOUNT, 0, 0).max(1) as i32;
         let item_h = POPUP.with(|c| c.borrow().as_ref().map(|p| p.item_h).unwrap_or(40));
         let w = (r.right - r.left).clamp(sc(300), sc(640));
-        let h = (count.min(12) * item_h + sc(6)).clamp(sc(44), sc(420));
+        let notice_h = POPUP.with(|c| {
+            c.borrow().as_ref().map_or(0, |p| if p.notice.is_some() { sc(28) } else { 0 })
+        });
+        let h = (count.min(12) * item_h + sc(6)).clamp(sc(44), sc(420)) + notice_h;
         // 相对对话框水平居中
         let mut x = r.left + (r.right - r.left - w) / 2;
         let mut y = r.bottom + sc(2);
@@ -223,7 +364,7 @@ fn reposition(dialog: HWND, hwnd: HWND, list: HWND) {
             x = x.clamp(wr.left, (wr.right - w).max(wr.left));
         }
         let _ = MoveWindow(hwnd, x, y, w, h, true);
-        let _ = MoveWindow(list, 0, 0, w, h, true);
+        let _ = MoveWindow(list, 0, notice_h, w, h - notice_h, true);
     }
 }
 
@@ -282,7 +423,7 @@ pub fn hide() {
     }
 }
 
-fn entry_at(idx: usize) -> Option<(EntryKind, String)> {
+fn entry_at(idx: usize) -> Option<PopupEntry> {
     POPUP.with(|c| c.borrow().as_ref().and_then(|p| p.entries.get(idx).cloned()))
 }
 
@@ -295,30 +436,97 @@ fn navigate_selected() {
     if sel < 0 {
         return;
     }
-    let Some((_, path)) = entry_at(sel as usize) else {
+    let Some(entry) = entry_at(sel as usize) else {
         return;
     };
-    if dialog.0.is_null() {
+    if dialog.0.is_null() || entry.source == EntrySource::Loading {
+        send(list, LB_SETCURSEL, usize::MAX, 0);
         return;
     }
-    ss_shell::navigate_dialog(dialog, &path);
-    ss_config::record_recent(&path);
+    if entry.dead {
+        set_notice(Some("这个位置已不存在。".to_string()));
+        send(list, LB_SETCURSEL, usize::MAX, 0);
+        return;
+    }
+    match ss_shell::navigate_dialog_checked(dialog, &entry.path) {
+        Ok(()) => {
+            set_notice(None);
+            ss_config::record_recent(&entry.path);
+        }
+        Err(e) => {
+            set_notice(Some(nav_error_text(&e)));
+            // 取消选中，这样再点一次同一项可以重试
+            send(list, LB_SETCURSEL, usize::MAX, 0);
+        }
+    }
+}
+
+fn nav_error_text(e: &NavError) -> String {
+    match e {
+        NavError::TargetNotResponding => {
+            "无法跳转：目标程序没有响应。文件名没有被改动，可以再点一次重试。".to_string()
+        }
+        NavError::FilenameBoxNotFound => "无法跳转：这个对话框里找不到文件名框。".to_string(),
+        NavError::Automation(m) => format!("无法跳转：{m}"),
+    }
+}
+
+fn set_notice(notice: Option<String>) {
+    let changed = POPUP.with(|c| {
+        c.borrow_mut().as_mut().is_some_and(|p| {
+            let changed = p.notice != notice;
+            p.notice = notice;
+            changed
+        })
+    });
+    if changed {
+        relayout();
+        if let Some((hwnd, _)) = popup_handles() {
+            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+        }
+    }
+}
+
+unsafe fn paint_notice(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let t = theme::current();
+    let state = POPUP.with(|c| c.borrow().as_ref().map(|p| (p.notice.clone(), p.font_path)));
+    if let Some((Some(text), font)) = state {
+        let mut rc = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rc);
+        rc.bottom = rc.top + sc(28);
+        FillRect(hdc, &rc, theme::solid_brush(t.err_bg));
+        SetBkMode(hdc, TRANSPARENT);
+        let mut tr = RECT { left: rc.left + sc(10), top: rc.top, right: rc.right - sc(10), bottom: rc.bottom };
+        draw_text(hdc, &text, &mut tr, t.err, font, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
+    let _ = EndPaint(hwnd, &ps);
 }
 
 unsafe fn show_context_menu(popup_hwnd: HWND, x: i32, y: i32) {
     let list = POPUP.with(|c| c.borrow().as_ref().map(|p| p.list));
     let Some(list) = list else { return };
-    let sel = send(list, LB_GETCURSEL, 0, 0);
-    if sel < 0 {
+    // 按鼠标所在的行，而不是当前选中的行
+    let mut pt = POINT { x, y };
+    let _ = ScreenToClient(list, &mut pt);
+    let lparam = ((pt.y as isize & 0xFFFF) << 16) | (pt.x as isize & 0xFFFF);
+    let hit = send(list, LB_ITEMFROMPOINT, 0, lparam);
+    // 高位为 1 表示不在任何一行上
+    if (hit >> 16) & 0xFFFF != 0 {
         return;
     }
-    let Some((_, path)) = entry_at(sel as usize) else {
+    let Some(entry) = entry_at((hit & 0xFFFF) as usize) else {
         return;
     };
+    if entry.source == EntrySource::Loading {
+        return;
+    }
+    let path = entry.path;
 
     let Ok(menu) = CreatePopupMenu() else { return };
     let fav = ss_config::is_favorite(&path);
-    let text = crate::wide(if fav { "移出收藏" } else { "添加到收藏 ★" });
+    let text = crate::wide(if fav { "移出收藏" } else { "添加到收藏" });
     let _ = AppendMenuW(menu, MF_STRING, IDM_FAV as usize, PCWSTR(text.as_ptr()));
     let _ = SetForegroundWindow(popup_hwnd);
     let cmd = TrackPopupMenu(
@@ -335,6 +543,10 @@ unsafe fn show_context_menu(popup_hwnd: HWND, x: i32, y: i32) {
     let _ = DestroyMenu(menu);
     if cmd.0 == IDM_FAV as i32 {
         ss_config::toggle_favorite(&path);
+        // 立即更新星标，不用等下次打开
+        if let Some(dialog) = current_dialog() {
+            show_for(dialog);
+        }
     }
 }
 
@@ -350,14 +562,6 @@ unsafe fn draw_text(hdc: HDC, s: &str, rect: &mut RECT, color: u32, font: HFONT,
     DrawTextW(hdc, &mut buf, rect, flags);
 }
 
-fn leaf_of(path: &str) -> &str {
-    let p = path.trim_end_matches('\\');
-    match p.rfind('\\') {
-        Some(i) => &p[i + 1..],
-        None => p,
-    }
-}
-
 unsafe fn draw_item(dis: &DRAWITEMSTRUCT) {
     let t = theme::current();
     let selected = dis.itemState.0 & ODS_SELECTED.0 != 0;
@@ -371,22 +575,30 @@ unsafe fn draw_item(dis: &DRAWITEMSTRUCT) {
     };
     // 兜底空 HFONT（POPUP 未初始化时 DC 用默认字体退化绘制），与其他绘制站点一致，
     // 避免 panic=abort 下裸 unwrap 拉死进程
-    let (fn_name, fn_path) = POPUP
-        .with(|c| c.borrow().as_ref().map(|p| (p.font_name, p.font_path)))
-        .unwrap_or((HFONT(std::ptr::null_mut()), HFONT(std::ptr::null_mut())));
+    let null_font = HFONT(std::ptr::null_mut());
+    let (fn_name, fn_path, fn_icon) = POPUP
+        .with(|c| c.borrow().as_ref().map(|p| (p.font_name, p.font_path, p.font_icon)))
+        .unwrap_or((null_font, null_font, null_font));
 
     crate::paint::buffered(dis.hDC, dis.rcItem, |hdc, rc| unsafe {
         FillRect(hdc, &rc, theme::solid_brush(bg));
-        let Some((kind, path)) = &entry else {
+        let Some(entry) = &entry else {
             return;
         };
+        SetBkMode(hdc, TRANSPARENT);
         let pad = sc(8);
+        if entry.source == EntrySource::Loading {
+            let mut lr = RECT { left: rc.left + pad, top: rc.top, right: rc.right - pad, bottom: rc.bottom };
+            draw_text(hdc, "正在读取已打开的资源管理器文件夹…", &mut lr, t.path_fg, fn_path, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+            return;
+        }
+        let path = &entry.path;
         let icon = sc(18);
         let icy = rc.top + (rc.bottom - rc.top - icon) / 2;
         if let Some(hicon) = icons::icon_for("folder", true) {
             let _ = DrawIconEx(hdc, rc.left + pad, icy, hicon, icon, icon, 0, None, DI_NORMAL);
         }
-        SetBkMode(hdc, TRANSPARENT);
+        let name_fg = if entry.dead { path_fg } else { fg };
         let tx = rc.left + pad + icon + pad;
         let tag_w = sc(56);
         let mut r1 = RECT {
@@ -395,39 +607,62 @@ unsafe fn draw_item(dis: &DRAWITEMSTRUCT) {
             right: rc.right - tag_w,
             bottom: rc.top + (rc.bottom - rc.top) / 2 + sc(2),
         };
-        draw_text(hdc, leaf_of(path), &mut r1, fg, fn_name, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        draw_text(hdc, leaf_of(path), &mut r1, name_fg, fn_name, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
         let mut r2 = RECT {
             left: tx,
             top: rc.top + (rc.bottom - rc.top) / 2 - sc(2),
-            right: rc.right - pad,
+            right: rc.right - tag_w,
             bottom: rc.bottom - sc(2),
         };
-        draw_text(hdc, path, &mut r2, path_fg, fn_path, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        draw_text(hdc, parent_of(path), &mut r2, path_fg, fn_path, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_PATH_ELLIPSIS);
 
-        let tag = match kind {
-            EntryKind::Favorite => "★ 收藏",
-            EntryKind::Recent => "最近",
-            EntryKind::Open => "",
+        // 来源标记：收藏用一颗实心星，其余用浅色文字
+        let mut rt = RECT {
+            left: rc.right - tag_w,
+            top: rc.top,
+            right: rc.right - sc(10),
+            bottom: rc.bottom,
         };
-        if !tag.is_empty() {
-            let color = if matches!(kind, EntryKind::Favorite) {
-                if selected { t.sel_fg } else { t.accent }
-            } else {
-                path_fg
-            };
-            let mut rt = RECT {
-                left: rc.right - tag_w,
-                top: rc.top,
-                right: rc.right - sc(6),
-                bottom: rc.bottom,
-            };
-            draw_text(hdc, tag, &mut rt, color, fn_path, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        let flags = DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
+        if entry.dead {
+            draw_text(hdc, "已失效", &mut rt, path_fg, fn_path, flags);
+        } else {
+            match entry.source {
+                EntrySource::Favorite => draw_text(hdc, "\u{E735}", &mut rt, t.star, fn_icon, flags),
+                EntrySource::Recent => draw_text(hdc, "最近", &mut rt, path_fg, fn_path, flags),
+                EntrySource::Open => draw_text(hdc, "已打开", &mut rt, path_fg, fn_path, flags),
+                EntrySource::Loading => {}
+            }
         }
     });
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        WM_PAINT => {
+            paint_notice(hwnd);
+            LRESULT(0)
+        }
+        WM_APP_OPEN_FOLDERS => {
+            let open = Box::from_raw(lp.0 as *mut Vec<String>);
+            let _ = KillTimer(Some(hwnd), LOADING_TIMER);
+            on_open_folders(*open);
+            LRESULT(0)
+        }
+        WM_APP_DEAD_PATHS => {
+            let dead = Box::from_raw(lp.0 as *mut Vec<String>);
+            on_dead_paths(*dead);
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == LOADING_TIMER => {
+            let _ = KillTimer(Some(hwnd), LOADING_TIMER);
+            let rest = POPUP.with(|c| c.borrow().as_ref().map(|p| without_loading(&p.entries)));
+            if let Some(rest) = rest {
+                set_entries(rest);
+                relayout();
+            }
+            LRESULT(0)
+        }
         WM_MEASUREITEM => {
             let mis = &mut *(lp.0 as *mut MEASUREITEMSTRUCT);
             let h = POPUP.with(|c| c.borrow().as_ref().map(|p| p.item_h).unwrap_or(40));

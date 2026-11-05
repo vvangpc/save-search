@@ -9,6 +9,7 @@ mod dlgpopup;
 mod icons;
 mod meta;
 mod paint;
+mod queue;
 mod search_worker;
 mod searchwin;
 mod settings_win;
@@ -494,23 +495,21 @@ unsafe extern "system" fn win_event_proc(
     match event {
         EVENT_OBJECT_SHOW => {
             if ss_shell::is_file_dialog(hwnd) && ss_config::load_settings().popup_enabled {
-                let entries = build_popup_entries();
-                dlgpopup::show_for(hwnd, entries);
+                dlgpopup::show_for(hwnd);
             }
         }
         EVENT_OBJECT_LOCATIONCHANGE => {
             dlgpopup::on_dialog_moved(hwnd);
         }
         EVENT_SYSTEM_FOREGROUND => {
-            // 对话框重新回到前台：重新枚举条目——用户可能在切走期间
-            // 新开/关闭了资源管理器文件夹（见 build_popup_entries）。
+            // 对话框重新回到前台：重新读取条目——用户可能在切走期间
+            // 新开/关闭了资源管理器文件夹。
             // 自进程窗口（浮窗）的 FOREGROUND 已被 WINEVENT_SKIPOWNPROCESS 过滤，
             // 右键菜单 SetForegroundWindow(popup) 不会进到这里。
             if dlgpopup::current_dialog() == Some(hwnd) {
                 // 复核仍是文件对话框：HWND 可能已被系统回收复用给无关窗口
                 if ss_shell::is_file_dialog(hwnd) {
-                    let entries = build_popup_entries();
-                    dlgpopup::show_for(hwnd, entries);
+                    dlgpopup::show_for(hwnd);
                 } else {
                     dlgpopup::hide();
                 }
@@ -525,44 +524,6 @@ unsafe extern "system" fn win_event_proc(
         }
         _ => {}
     }
-}
-
-/// 组装浮窗条目：收藏 + 已打开资源管理器 + 最近位置（按路径去重，遵循设置显示项）。
-fn build_popup_entries() -> Vec<(dlgpopup::EntryKind, String)> {
-    use dlgpopup::EntryKind;
-    let s = ss_config::load_settings();
-    // 顺序即优先级：收藏 > 已打开 > 最近。seen 去重为 first-seen-wins，
-    // 同一路径只保留最高优先级来源。务必保持下面三个采集块的先后顺序。
-    let mut out: Vec<(EntryKind, String)> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    let mut add = |kind: EntryKind, path: String| {
-        if path.is_empty() || seen.iter().any(|p| same_path(p, &path)) {
-            return;
-        }
-        seen.push(path.clone());
-        out.push((kind, path));
-    };
-    if s.popup_show_favorites {
-        for f in ss_config::favorites() {
-            add(EntryKind::Favorite, f);
-        }
-    }
-    if s.popup_show_open {
-        for f in ss_shell::enumerate_open_folders() {
-            add(EntryKind::Open, f);
-        }
-    }
-    if s.popup_show_recent {
-        for f in ss_config::recent() {
-            add(EntryKind::Recent, f);
-        }
-    }
-    out
-}
-
-fn same_path(a: &str, b: &str) -> bool {
-    a.trim_end_matches('\\')
-        .eq_ignore_ascii_case(b.trim_end_matches('\\'))
 }
 
 /// 开机自启：建/删「最高权限」登录计划任务（免 UAC）。需管理员权限（本程序已提权）。

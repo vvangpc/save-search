@@ -5,8 +5,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::mpsc::{channel, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
@@ -16,12 +15,14 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 
+use crate::queue::WorkQueue;
+
 const DIR_KEY: &str = "\u{1}dir";
 const NO_EXT_KEY: &str = "\u{1}none";
 
 /// 键 → 图标句柄。0 表示正在加载或加载失败。
 static CACHE: Mutex<Option<HashMap<String, isize>>> = Mutex::new(None);
-static REQUESTS: OnceLock<Sender<String>> = OnceLock::new();
+static REQUESTS: WorkQueue<String> = WorkQueue::new();
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -61,13 +62,10 @@ fn load_icon(key: &str) -> isize {
 
 /// 启动加载线程，并预加载文件夹图标。`on_loaded` 在加载线程上调用。
 pub fn start(on_loaded: fn()) {
-    let (tx, rx) = channel::<String>();
-    if REQUESTS.set(tx).is_err() {
-        return;
-    }
     std::thread::spawn(move || {
         let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-        for key in rx {
+        loop {
+            let key = REQUESTS.pop();
             let icon = load_icon(&key);
             if let Some(map) = CACHE.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
                 map.insert(key, icon);
@@ -99,8 +97,6 @@ pub fn icon_for(name: &str, is_dir: bool) -> Option<HICON> {
     }
     map.insert(key.clone(), 0);
     drop(guard);
-    if let Some(tx) = REQUESTS.get() {
-        let _ = tx.send(key);
-    }
+    REQUESTS.push(key);
     None
 }

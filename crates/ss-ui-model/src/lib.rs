@@ -2,6 +2,7 @@
 
 mod scroll;
 mod selection;
+mod popup;
 mod scope;
 mod seq;
 mod status;
@@ -9,6 +10,9 @@ mod text;
 
 pub use scroll::{ease_toward, ListGeometry};
 pub use selection::{moved, reselect, SelMove};
+pub use popup::{
+    initial_entries, leaf_of, mark_dead, merge_open, without_loading, EntrySource, PopupEntry,
+};
 pub use scope::{scope_index, scope_key};
 pub use seq::RequestSeq;
 pub use text::{

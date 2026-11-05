@@ -1,13 +1,14 @@
 //! 后台读取可见行的大小和修改时间。索引里没有这两项。
 
 use std::io::ErrorKind;
-use std::sync::mpsc::{channel, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ss_ui_model::{format_date, format_size, LocalTime};
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+
+use crate::queue::WorkQueue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowMeta {
@@ -17,7 +18,7 @@ pub enum RowMeta {
     Info { size: String, modified: String },
 }
 
-static REQUESTS: OnceLock<Sender<Vec<String>>> = OnceLock::new();
+static REQUESTS: WorkQueue<Vec<String>> = WorkQueue::new();
 static RESULTS: Mutex<Vec<(String, RowMeta)>> = Mutex::new(Vec::new());
 
 /// FILETIME 的起点（1601 年）到 Unix 起点的秒数。
@@ -62,12 +63,9 @@ fn read_meta(path: &str, now: Option<LocalTime>) -> RowMeta {
 
 /// 启动读取线程。`on_ready` 在读取线程上调用。
 pub fn start(on_ready: fn()) {
-    let (tx, rx) = channel::<Vec<String>>();
-    if REQUESTS.set(tx).is_err() {
-        return;
-    }
     std::thread::spawn(move || {
-        for batch in rx {
+        loop {
+            let batch = REQUESTS.pop();
             let now = to_local(SystemTime::now());
             let read: Vec<(String, RowMeta)> = batch
                 .into_iter()
@@ -83,9 +81,7 @@ pub fn start(on_ready: fn()) {
 }
 
 pub fn request(paths: Vec<String>) {
-    if let Some(tx) = REQUESTS.get() {
-        let _ = tx.send(paths);
-    }
+    REQUESTS.push(paths);
 }
 
 /// 取走已经读好的结果。
