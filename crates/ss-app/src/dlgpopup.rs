@@ -77,7 +77,6 @@ struct Popup {
     notice: Option<String>,
     font_name: HFONT,
     font_path: HFONT,
-    font_icon: HFONT,
     item_h: i32,
     dpi: i32,
     /// Windows 11 由系统画圆角；更早的系统用窗口区域裁剪。
@@ -152,7 +151,6 @@ pub fn init() -> windows::core::Result<()> {
         let dpi = GetDpiForWindow(hwnd).max(96) as i32;
         let font_name = crate::paint::ui_font(dpi * 14 / 96, 400);
         let font_path = crate::paint::ui_font(dpi * 12 / 96, 400);
-        let font_icon = crate::paint::icon_font(dpi * 13 / 96, 400);
 
         let rounded_by_system = theme::round_corners(hwnd);
         POPUP.with(|c| {
@@ -165,7 +163,6 @@ pub fn init() -> windows::core::Result<()> {
                 notice: None,
                 font_name,
                 font_path,
-                font_icon,
                 item_h: dpi * ITEM_H / 96,
                 dpi,
                 rounded_by_system,
@@ -577,9 +574,9 @@ unsafe fn draw_item(dis: &DRAWITEMSTRUCT) {
     // 兜底空 HFONT（POPUP 未初始化时 DC 用默认字体退化绘制），与其他绘制站点一致，
     // 避免 panic=abort 下裸 unwrap 拉死进程
     let null_font = HFONT(std::ptr::null_mut());
-    let (fn_name, fn_path, fn_icon) = POPUP
-        .with(|c| c.borrow().as_ref().map(|p| (p.font_name, p.font_path, p.font_icon)))
-        .unwrap_or((null_font, null_font, null_font));
+    let (fn_name, fn_path) = POPUP
+        .with(|c| c.borrow().as_ref().map(|p| (p.font_name, p.font_path)))
+        .unwrap_or((null_font, null_font));
 
     crate::paint::buffered(dis.hDC, dis.rcItem, |hdc, rc| unsafe {
         FillRect(hdc, &rc, theme::solid_brush(t.bg));
@@ -599,12 +596,20 @@ unsafe fn draw_item(dis: &DRAWITEMSTRUCT) {
         }
         let name_fg = if entry.dead { t.path_fg } else { t.fg };
         let path = &entry.path;
-        // 第一列是星标，只有收藏才有
-        let star_w = sc(18);
+        // 第一列是收藏标记，只有收藏才有
+        let mark_w = sc(18);
         if entry.source == EntrySource::Favorite {
-            let mut sr = RECT { left: rc.left + pad, top: rc.top, right: rc.left + pad + star_w, bottom: rc.bottom };
-            let color = if entry.dead { t.thumb } else { t.star };
-            draw_text(hdc, "\u{E735}", &mut sr, color, fn_icon, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+            let top = rc.top + (rc.bottom - rc.top - mark_w) / 2;
+            let mark = RECT { left: rc.left + pad, top, right: rc.left + pad + mark_w, bottom: top + mark_w };
+            let (tile, glyph) = if entry.dead {
+                (t.alt_bg, t.thumb)
+            } else if selected {
+                // 选中行的底色和标记底色相同，这里换成白底才看得出来
+                (t.bg, t.accent)
+            } else {
+                (t.sel_bg, t.accent)
+            };
+            crate::paint::bookmark_icon(hdc, mark, tile, glyph, row_bg);
         }
         let source = match (entry.source, entry.dead) {
             (EntrySource::Favorite, true) => "收藏（已失效）",
@@ -618,7 +623,7 @@ unsafe fn draw_item(dis: &DRAWITEMSTRUCT) {
         let mut rt = RECT { left: rc.right - pad - source_w, top: rc.top, right: rc.right - pad, bottom: rc.bottom };
         draw_text(hdc, source, &mut rt, t.path_fg, fn_path, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
-        let tx = rc.left + pad + star_w + sc(6);
+        let tx = rc.left + pad + mark_w + sc(10);
         let right = rt.left - sc(10);
         let mid = rc.top + (rc.bottom - rc.top) / 2;
         let mut r1 = RECT { left: tx, top: rc.top + sc(3), right, bottom: mid + sc(2) };
@@ -659,14 +664,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let dpi = ((wp.0 & 0xFFFF) as i32).max(96);
             let font_name = crate::paint::ui_font(dpi * 14 / 96, 400);
             let font_path = crate::paint::ui_font(dpi * 12 / 96, 400);
-            let font_icon = crate::paint::icon_font(dpi * 13 / 96, 400);
-            let item_h = dpi * ITEM_H / 96;
+                let item_h = dpi * ITEM_H / 96;
             let old = POPUP.with(|c| {
                 c.borrow_mut().as_mut().map(|p| {
-                    let old = [p.font_name, p.font_path, p.font_icon];
+                    let old = [p.font_name, p.font_path];
                     p.font_name = font_name;
                     p.font_path = font_path;
-                    p.font_icon = font_icon;
                     p.item_h = item_h;
                     p.dpi = dpi;
                     old
