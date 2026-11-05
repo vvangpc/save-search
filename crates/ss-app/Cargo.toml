@@ -16,6 +16,7 @@ test = false
 ss-core = { workspace = true }
 ss-shell = { workspace = true }
 ss-config = { workspace = true }
+ss-ui-model = { workspace = true }
 parking_lot = { workspace = true }
 windows = { workspace = true, features = [
     "Win32_Foundation",

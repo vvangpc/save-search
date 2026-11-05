@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use ss_core::{Catalog, Category, SearchResult};
+use ss_ui_model::{ease_toward, moved, ListGeometry, SelMove};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -652,25 +653,24 @@ pub fn pretranslate(msg: &MSG) -> bool {
         open_selected();
         return true;
     }
-    let (count, item_h, _cw, ch, _) = list_metrics(list);
-    if count == 0 {
-        return false;
-    }
-    let cur = UI.with(|c| c.borrow().as_ref().map(|u| u.sel).unwrap_or(-1));
-    let page = (ch / item_h.max(1)).max(1);
-    let new = if vk == VK_DOWN.0 {
-        cur + 1
+    let how = if vk == VK_DOWN.0 {
+        SelMove::Down
     } else if vk == VK_UP.0 {
-        cur - 1
+        SelMove::Up
     } else if vk == VK_NEXT.0 {
-        cur + page
+        SelMove::PageDown
     } else if vk == VK_PRIOR.0 {
-        cur - page
+        SelMove::PageUp
     } else if vk == VK_HOME.0 {
-        0
+        SelMove::Home
     } else if vk == VK_END.0 {
-        count - 1
+        SelMove::End
     } else {
+        return false;
+    };
+    let g = geometry(list);
+    let cur = UI.with(|c| c.borrow().as_ref().map(|u| u.sel).unwrap_or(-1));
+    let Some(new) = moved(cur, how, g.count, g.page()) else {
         return false;
     };
     set_sel(list, new);
@@ -763,26 +763,22 @@ unsafe fn draw_cat_button(dis: &DRAWITEMSTRUCT) {
 
 // ---- 结果列表（自绘 + 平滑滚动）----
 
-/// (count, item_h, client_w, client_h, max_scroll)
-fn list_metrics(list: HWND) -> (i32, i32, i32, i32, f32) {
+fn geometry(list: HWND) -> ListGeometry {
     let mut rc = RECT::default();
     let _ = unsafe { GetClientRect(list, &mut rc) };
-    let cw = rc.right - rc.left;
-    let ch = rc.bottom - rc.top;
     let (count, item_h) = UI.with(|c| {
         c.borrow()
             .as_ref()
             .map(|u| (u.results.len() as i32, u.item_h))
             .unwrap_or((0, 46))
     });
-    let total = count * item_h;
-    let max_scroll = (total - ch).max(0) as f32;
-    (count, item_h, cw, ch, max_scroll)
+    ListGeometry { count, item_h, view_h: rc.bottom - rc.top, extra_h: 0 }
 }
 
 unsafe fn update_scrollbar(list: HWND) {
-    let (count, item_h, _cw, ch, _max) = list_metrics(list);
-    let total = (count * item_h).max(0);
+    let g = geometry(list);
+    let total = g.total().max(0);
+    let ch = g.view_h;
     let pos = UI.with(|c| c.borrow().as_ref().map(|u| u.scroll_y as i32).unwrap_or(0));
     let si = SCROLLINFO {
         cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
@@ -815,7 +811,7 @@ fn start_anim(list: HWND) {
 }
 
 fn set_target(list: HWND, y: f32) {
-    let (_, _, _, _, max_scroll) = list_metrics(list);
+    let max_scroll = geometry(list).max_scroll();
     if max_scroll <= 0.0 {
         // 内容不足一屏：直接归零，不空转定时器
         UI.with(|c| {
@@ -854,7 +850,7 @@ fn stop_anim(list: HWND) {
 
 /// 设置选中项（钳到范围），滚动到可见并重绘。
 fn set_sel(list: HWND, idx: i32) {
-    let (count, _, _, _, _) = list_metrics(list);
+    let count = geometry(list).count;
     if count == 0 {
         return;
     }
@@ -871,16 +867,8 @@ fn set_sel(list: HWND, idx: i32) {
 }
 
 fn ensure_visible(list: HWND, idx: i32) {
-    let (_, item_h, _cw, ch, _max) = list_metrics(list);
-    let (target, _) = UI.with(|c| c.borrow().as_ref().map(|u| (u.target_y, u.scroll_y)).unwrap_or((0.0, 0.0)));
-    let top = (idx * item_h) as f32;
-    let bot = top + item_h as f32;
-    let mut new_t = target;
-    if top < target {
-        new_t = top;
-    } else if bot > target + ch as f32 {
-        new_t = bot - ch as f32;
-    }
+    let target = UI.with(|c| c.borrow().as_ref().map(|u| u.target_y).unwrap_or(0.0));
+    let new_t = geometry(list).ensure_visible(idx, target);
     if (new_t - target).abs() > 0.5 {
         set_target(list, new_t);
     }
@@ -927,11 +915,12 @@ unsafe fn paint_list(list: HWND) {
     let mut rc = RECT::default();
     let _ = GetClientRect(list, &mut rc);
     let t = theme::current();
-    let (item_h, scroll_y, sel, hover, fname, fpath) = UI.with(|c| {
+    let g = geometry(list);
+    let (scroll_y, sel, hover, fname, fpath) = UI.with(|c| {
         c.borrow()
             .as_ref()
-            .map(|u| (u.item_h, u.scroll_y, u.sel, u.hover, u.font_name, u.font_path))
-            .unwrap_or((46, 0.0, -1, -1, HFONT(std::ptr::null_mut()), HFONT(std::ptr::null_mut())))
+            .map(|u| (u.scroll_y, u.sel, u.hover, u.font_name, u.font_path))
+            .unwrap_or((0.0, -1, -1, HFONT(std::ptr::null_mut()), HFONT(std::ptr::null_mut())))
     });
     let full = rc;
     paint::buffered(hdc, full, |mem, lrc| unsafe {
@@ -940,18 +929,15 @@ unsafe fn paint_list(list: HWND) {
         let Some(results) = results else {
             return;
         };
-        let count = results.len() as i32;
-        if count > 0 && item_h > 0 {
+        if let Some((first, last)) = g.visible(scroll_y) {
             let sy = scroll_y as i32;
-            let first = (sy / item_h).max(0);
-            let last = ((sy + lrc.bottom) / item_h).min(count - 1);
             for i in first..=last {
-                let y = i * item_h - sy;
+                let y = i * g.item_h - sy;
                 let item_rect = RECT {
                     left: 0,
                     top: y,
                     right: lrc.right,
-                    bottom: y + item_h,
+                    bottom: y + g.item_h,
                 };
                 if let Some(r) = results.get(i as usize) {
                     draw_one(mem, item_rect, r, i == sel, i == hover, &t, fname, fpath);
@@ -963,17 +949,8 @@ unsafe fn paint_list(list: HWND) {
 }
 
 fn y_to_index(list: HWND, y: i32) -> i32 {
-    let (count, item_h, _, _, _) = list_metrics(list);
     let scroll_y = UI.with(|c| c.borrow().as_ref().map(|u| u.scroll_y).unwrap_or(0.0));
-    if item_h <= 0 {
-        return -1;
-    }
-    let idx = (y + scroll_y as i32) / item_h;
-    if idx >= 0 && idx < count {
-        idx
-    } else {
-        -1
-    }
+    geometry(list).index_at(y, scroll_y).unwrap_or(-1)
 }
 
 unsafe extern "system" fn results_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -985,15 +962,15 @@ unsafe extern "system" fn results_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         }
         WM_MOUSEWHEEL => {
             let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
-            let (_, item_h, _, _, _) = list_metrics(hwnd);
-            let step = item_h as f32 * 1.5;
+            let step = geometry(hwnd).item_h as f32 * 1.5;
             let target = UI.with(|c| c.borrow().as_ref().map(|u| u.target_y).unwrap_or(0.0));
             set_target(hwnd, target - (delta as f32 / 120.0) * step);
             LRESULT(0)
         }
         WM_VSCROLL => {
             let code = (wp.0 as u32) & 0xFFFF;
-            let (_, item_h, _, ch, _) = list_metrics(hwnd);
+            let g = geometry(hwnd);
+            let (item_h, ch) = (g.item_h, g.view_h);
             let target = UI.with(|c| c.borrow().as_ref().map(|u| u.target_y).unwrap_or(0.0));
             match SCROLLBAR_COMMAND(code as i32) {
                 SB_LINEUP => set_target(hwnd, target - item_h as f32),
@@ -1007,7 +984,7 @@ unsafe extern "system" fn results_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                         ..Default::default()
                     };
                     let _ = GetScrollInfo(hwnd, SB_VERT, &mut si);
-                    let (_, _, _, _, max_scroll) = list_metrics(hwnd);
+                    let max_scroll = geometry(hwnd).max_scroll();
                     let pos = (si.nTrackPos as f32).clamp(0.0, max_scroll);
                     UI.with(|c| {
                         if let Some(u) = c.borrow_mut().as_mut() {
@@ -1023,19 +1000,16 @@ unsafe extern "system" fn results_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
         WM_TIMER => {
-            let (_, _, _, _, max_scroll) = list_metrics(hwnd);
+            let max_scroll = geometry(hwnd).max_scroll();
             let done = UI.with(|c| {
                 c.borrow_mut().as_mut().map(|u| {
                     u.target_y = u.target_y.clamp(0.0, max_scroll);
-                    let d = u.target_y - u.scroll_y;
-                    if d.abs() < 0.5 {
-                        u.scroll_y = u.target_y;
+                    let (pos, arrived) = ease_toward(u.scroll_y, u.target_y);
+                    u.scroll_y = pos;
+                    if arrived {
                         u.animating = false;
-                        true
-                    } else {
-                        u.scroll_y += d * 0.30;
-                        false
                     }
+                    arrived
                 })
             });
             if done == Some(true) {
@@ -1110,7 +1084,7 @@ unsafe extern "system" fn results_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
         WM_SIZE => {
-            let (_, _, _, _, max_scroll) = list_metrics(hwnd);
+            let max_scroll = geometry(hwnd).max_scroll();
             UI.with(|c| {
                 if let Some(u) = c.borrow_mut().as_mut() {
                     u.scroll_y = u.scroll_y.min(max_scroll);
