@@ -13,7 +13,7 @@ mod settings_win;
 mod theme;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -54,6 +54,55 @@ static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 /// 全局目录/缓存目录句柄：供 wndproc 在关机/注销（WM_QUERYENDSESSION）时抢救性保存索引。
 static CATALOG: OnceLock<searchwin::SharedCatalog> = OnceLock::new();
 static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// 搜索窗句柄（整数形式，供后台线程发消息）。
+static SEARCH_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 上次成功读取文件变更的时间（Unix 秒），0 表示还没有。
+static LAST_SYNC: AtomicU64 = AtomicU64::new(0);
+static REBUILDING: AtomicBool = AtomicBool::new(false);
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 距离上次读取文件变更的秒数。
+pub(crate) fn synced_secs_ago() -> Option<u64> {
+    match LAST_SYNC.load(Ordering::Relaxed) {
+        0 => None,
+        t => Some(unix_now().saturating_sub(t)),
+    }
+}
+
+fn post_to_search(msg: u32) {
+    let raw = SEARCH_HWND.load(Ordering::Relaxed);
+    if raw != 0 {
+        let h = HWND(raw as *mut core::ffi::c_void);
+        let _ = unsafe { PostMessageW(Some(h), msg, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+/// 在后台重建这些盘的索引，旧索引继续服务搜索。已有重建在进行时返回 false。
+pub(crate) fn rebuild_drives(letters: Vec<char>) -> bool {
+    if REBUILDING.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    std::thread::spawn(move || {
+        for letter in letters {
+            if let Ok(idx) = ss_core::build_index_for_drive(letter) {
+                if let Some(cat) = CATALOG.get() {
+                    if let Some(c) = cat.write().as_mut() {
+                        c.replace_index(idx);
+                    }
+                }
+            }
+        }
+        REBUILDING.store(false, Ordering::Release);
+        post_to_search(searchwin::WM_APP_INDEX_READY);
+    });
+    true
+}
 
 /// 保存索引缓存（正常退出与会话结束共用）。
 fn save_catalog_cache() {
@@ -282,16 +331,24 @@ fn main() -> windows::core::Result<()> {
         let _ = CATALOG.set(catalog.clone());
         let _ = CACHE_DIR.set(cache_dir.clone());
         let search_hwnd = searchwin::init(catalog.clone())?;
+        SEARCH_HWND.store(search_hwnd.0 as isize, Ordering::Relaxed);
         {
             let catalog2 = catalog.clone();
             let cache2 = cache_dir.clone();
             let drives = settings.indexed_drives.clone();
-            let hwnd_raw = search_hwnd.0 as isize;
             std::thread::spawn(move || {
-                let cat = ss_core::Catalog::build_or_load(&cache2, &drives);
+                let cat = ss_core::Catalog::build_or_load_with_progress(
+                    &cache2,
+                    &drives,
+                    &|letter, state| {
+                        if searchwin::record_index_state(letter, state) {
+                            post_to_search(searchwin::WM_APP_INDEX_PROGRESS);
+                        }
+                    },
+                );
                 *catalog2.write() = Some(cat);
-                let h = HWND(hwnd_raw as *mut core::ffi::c_void);
-                let _ = PostMessageW(Some(h), searchwin::WM_APP_INDEX_READY, WPARAM(0), LPARAM(0));
+                LAST_SYNC.store(unix_now(), Ordering::Relaxed);
+                post_to_search(searchwin::WM_APP_INDEX_READY);
             });
         }
 
@@ -311,6 +368,7 @@ fn main() -> windows::core::Result<()> {
                         Some(c) => c.usn_positions(),
                         None => continue,
                     };
+                    let mut all_read = true;
                     for (letter, jid, from) in positions {
                         if let Ok((changes, new_next)) = ss_core::read_changes(letter, jid, from) {
                             if changes.is_empty() && new_next == from {
@@ -319,7 +377,12 @@ fn main() -> windows::core::Result<()> {
                             if let Some(c) = catalog3.write().as_mut() {
                                 c.apply_drive_changes(letter, &changes, new_next);
                             }
+                        } else {
+                            all_read = false;
                         }
+                    }
+                    if all_read {
+                        LAST_SYNC.store(unix_now(), Ordering::Relaxed);
                     }
 
                     // 墓碑回收：长时程高频增删会让被删节点（墓碑）无限累积，内存只增不减。

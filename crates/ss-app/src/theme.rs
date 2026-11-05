@@ -26,6 +26,13 @@ pub struct Theme {
     pub sel_bg: u32,
     pub sel_fg: u32,
     pub alt_bg: u32,
+    pub accent_fg: u32,
+    pub border: u32,
+    pub warn: u32,
+    pub warn_bg: u32,
+    pub err: u32,
+    pub err_bg: u32,
+    pub star: u32,
 }
 
 const LIGHT: Theme = Theme {
@@ -36,6 +43,13 @@ const LIGHT: Theme = Theme {
     sel_bg: rgb(0xE6, 0xEF, 0xFB),
     sel_fg: rgb(0x1C, 0x24, 0x30),
     alt_bg: rgb(0xF4, 0xF6, 0xF8),
+    accent_fg: rgb(0xFF, 0xFF, 0xFF),
+    border: rgb(0xDF, 0xE3, 0xE8),
+    warn: rgb(0x7F, 0x4D, 0x00),
+    warn_bg: rgb(0xFF, 0xF4, 0xE0),
+    err: rgb(0xA3, 0x26, 0x26),
+    err_bg: rgb(0xFD, 0xEA, 0xEA),
+    star: rgb(0xE8, 0xA3, 0x17),
 };
 
 thread_local! {

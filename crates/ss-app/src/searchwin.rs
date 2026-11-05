@@ -8,16 +8,20 @@ use std::ffi::c_void;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
-use ss_core::{Catalog, Category, SearchResult};
-use ss_ui_model::{ease_toward, moved, ListGeometry, SelMove};
+use parking_lot::{Mutex, RwLock};
+use ss_core::{Catalog, Category, DriveState, Scope, ScopeStatus, SearchRequest, SearchResult};
+use ss_ui_model::{
+    all_drives_label, banner, body, ease_toward, moved, status_line, Banner, Body, BuildProgress,
+    DriveFailure, ListGeometry, ScopeProblem, SelMove, ViewInput,
+};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, DrawTextW, EndPaint, FillRect, GetDC, GetMonitorInfoW,
+    BeginPaint, CreateFontW, DrawTextW, EndPaint, FillRect, FrameRect, GetDC, GetMonitorInfoW,
     GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint, ReleaseDC, SelectObject, SetBkMode,
     SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DRAW_TEXT_FORMAT,
-    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT,
+    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HDC,
+    HFONT,
     HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -38,10 +42,10 @@ use crate::theme::Theme;
 pub type SharedCatalog = Arc<RwLock<Option<Catalog>>>;
 
 pub const WM_APP_INDEX_READY: u32 = WM_APP + 2;
+pub const WM_APP_INDEX_PROGRESS: u32 = WM_APP + 3;
 
 const EDIT_ID: u32 = 101;
 const COMBO_ID: u32 = 103;
-const COUNT_ID: u32 = 104;
 const CAT_BASE: u32 = 300;
 const ANIM_TIMER: usize = 1;
 
@@ -78,9 +82,70 @@ mod st {
     pub const CBS_OWNERDRAWFIXED: u32 = 0x0010;
     pub const CBS_HASSTRINGS: u32 = 0x0200;
     pub const BS_OWNERDRAW: u32 = 0x0000_000B;
-    pub const SS_LEFT: u32 = 0x0000_0000;
     pub const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
     pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+}
+
+/// 可点击文字或按钮的动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Act {
+    SearchAllScopes,
+    ClearCategory,
+    RemovePreset,
+    RetryFailedDrives,
+}
+
+/// 空输入页的行标记。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowTag {
+    Recent,
+    Favorite,
+}
+
+/// 空输入页的语法提示。
+const HINTS: [(&str, &str); 5] = [
+    ("report 2024", "同时包含两个词"),
+    ("*.pdf", "以 .pdf 结尾"),
+    ("ext:pdf,docx", "按扩展名筛选"),
+    ("dir:", "只看文件夹"),
+    ("工作\\ 报告", "路径包含“工作”、文件名包含“报告”"),
+];
+
+/// 一次搜索的结果摘要（`results` 之外的部分）。
+#[derive(Default)]
+struct Summary {
+    total_hits: usize,
+    elapsed_ms: u32,
+    scope_problem: Option<ScopeProblem>,
+}
+
+/// 正在建立索引的盘。索引线程写入，界面线程读取。
+static BUILDING: Mutex<Vec<BuildProgress>> = Mutex::new(Vec::new());
+static LAST_PROGRESS_POST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// 记录索引线程报告的状态，返回是否值得通知界面。进度事件很多，所以限制频率。
+pub fn record_index_state(letter: char, state: DriveState) -> bool {
+    let mut building = BUILDING.lock();
+    let is_progress = if let DriveState::Building { done, estimated } = state {
+        match building.iter_mut().find(|p| p.letter == letter) {
+            Some(p) => {
+                p.done = done;
+                p.estimated = estimated;
+            }
+            None => building.push(BuildProgress { letter, done, estimated }),
+        }
+        true
+    } else {
+        building.retain(|p| p.letter != letter);
+        false
+    };
+    drop(building);
+    let mut last = LAST_PROGRESS_POST.lock();
+    if is_progress && last.is_some_and(|t| t.elapsed().as_millis() < 200) {
+        return false;
+    }
+    *last = Some(std::time::Instant::now());
+    true
 }
 
 struct Ui {
@@ -88,8 +153,21 @@ struct Ui {
     edit: HWND,
     list: HWND,
     combo: HWND,
-    count: HWND,
+    banner_wnd: HWND,
+    foot_wnd: HWND,
     cats: Vec<HWND>,
+    row_tags: Vec<RowTag>,
+    extra_h: i32,
+    query_text: String,
+    summary: Summary,
+    index_ready: bool,
+    failed: Vec<DriveFailure>,
+    total_files: usize,
+    view_body: Body,
+    view_banner: Option<Banner>,
+    status: String,
+    list_hits: Vec<(RECT, Act)>,
+    banner_hits: Vec<(RECT, Act)>,
     /// Rc：绘制时克隆一次句柄即可在 RefCell 借用外读取，不必每帧逐项 clone 字符串
     results: Rc<Vec<SearchResult>>,
     drives: Vec<char>,
@@ -187,7 +265,7 @@ fn update_combo_width() {
     let cw_total = client.right - client.left;
     let m = sc_dpi(10);
     let min_w = sc_dpi(110);
-    let max_w = (cw_total - 2 * m - sc_dpi(6) - sc_dpi(180)).max(min_w);
+    let max_w = (cw_total / 3 - m).max(min_w);
     let w = (tw + sc_dpi(40)).clamp(min_w, max_w);
     UI.with(|c| {
         if let Some(u) = c.borrow_mut().as_mut() {
@@ -212,6 +290,17 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
             ..Default::default()
         };
         RegisterClassW(&wc);
+
+        // 横幅和状态栏共用的自绘窗口类
+        let strip_class = w!("SaveSearchStrip");
+        let wcs = WNDCLASSW {
+            lpfnWndProc: Some(strip_proc),
+            hInstance: hinstance,
+            lpszClassName: strip_class,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            ..Default::default()
+        };
+        RegisterClassW(&wcs);
 
         // 自绘结果列表的窗口类（CS_DBLCLKS：启用双击消息 WM_LBUTTONDBLCLK）
         let list_class = w!("SaveSearchResults");
@@ -275,14 +364,24 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
             None,
             Some(hinstance), None,
         )?;
-        let count = CreateWindowExW(
+        let banner_wnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("STATIC"),
+            strip_class,
             PCWSTR::null(),
-            WINDOW_STYLE(st::WS_CHILD | st::WS_VISIBLE | st::SS_LEFT),
+            WINDOW_STYLE(st::WS_CHILD),
             0, 0, 10, 10,
             Some(hwnd),
-            Some(HMENU(COUNT_ID as usize as *mut c_void)),
+            None,
+            Some(hinstance), None,
+        )?;
+        let foot_wnd = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            strip_class,
+            PCWSTR::null(),
+            WINDOW_STYLE(st::WS_CHILD | st::WS_VISIBLE),
+            0, 0, 10, 10,
+            Some(hwnd),
+            None,
             Some(hinstance), None,
         )?;
 
@@ -309,7 +408,6 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
         let font_icon = make_font(sc(15), 400, w!("Segoe MDL2 Assets"));
         set_font(edit, font_ui);
         set_font(combo, font_ui);
-        set_font(count, font_path);
         for b in &cats {
             set_font(*b, font_ui);
         }
@@ -329,8 +427,21 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
                 edit,
                 list,
                 combo,
-                count,
+                banner_wnd,
+                foot_wnd,
                 cats,
+                row_tags: Vec::new(),
+                extra_h: 0,
+                query_text: String::new(),
+                summary: Summary::default(),
+                index_ready: false,
+                failed: Vec::new(),
+                total_files: 0,
+                view_body: Body::Home,
+                view_banner: None,
+                status: String::new(),
+                list_hits: Vec::new(),
+                banner_hits: Vec::new(),
                 results: Rc::new(Vec::new()),
                 drives: Vec::new(),
                 presets: Vec::new(),
@@ -358,6 +469,7 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
         if !last.is_empty() {
             set_text(edit, &last);
         }
+        do_search();
         Ok(hwnd)
     }
 }
@@ -373,31 +485,38 @@ unsafe fn layout(hwnd: HWND) {
     let eh = sc_dpi(30);
     let cw = UI.with(|c| c.borrow().as_ref().map(|u| u.combo_w).unwrap_or(sc_dpi(110)));
     let cath = sc_dpi(30);
-    let counth = sc_dpi(20);
+    let foot_h = sc_dpi(26);
+    let banner_h = sc_dpi(30);
     // 先取句柄并释放借用，再在借用外 MoveWindow——MoveWindow(list) 会同步回调
     // results_proc 的 WM_SIZE（内部 borrow_mut），若此时仍持借用会 RefCell 双借用崩溃。
-    let Some((edit, combo, list, count, cats)) = UI.with(|c| {
-        c.borrow()
-            .as_ref()
-            .map(|u| (u.edit, u.combo, u.list, u.count, u.cats.clone()))
+    let Some((edit, combo, list, banner_wnd, foot_wnd, cats, has_banner)) = UI.with(|c| {
+        c.borrow().as_ref().map(|u| {
+            (u.edit, u.combo, u.list, u.banner_wnd, u.foot_wnd, u.cats.clone(), u.view_banner.is_some())
+        })
     }) else {
         return;
     };
-    let edit_w = w - 2 * m - cw - sc_dpi(6);
-    let _ = MoveWindow(edit, m, m, edit_w, eh, true);
-    let _ = MoveWindow(combo, m + edit_w + sc_dpi(6), m, cw, 260, true);
+    let _ = MoveWindow(edit, m, m, w - 2 * m, eh, true);
     let row_y = m + eh + sc_dpi(8);
     let n = cats.len() as i32;
     let gap = sc_dpi(4);
-    let bw = (w - 2 * m - gap * (n - 1)) / n;
+    let _ = MoveWindow(combo, w - m - cw, row_y, cw, 260, true);
+    let bw = (w - 2 * m - cw - gap * n) / n;
     for (i, b) in cats.iter().enumerate() {
         let x = m + (bw + gap) * i as i32;
         let _ = MoveWindow(*b, x, row_y, bw, cath, true);
     }
-    let list_y = row_y + cath + sc_dpi(8);
-    let list_h = h - list_y - counth - m;
+    let mut list_y = row_y + cath + sc_dpi(8);
+    if has_banner {
+        let _ = MoveWindow(banner_wnd, 0, list_y, w, banner_h, true);
+        let _ = ShowWindow(banner_wnd, SW_SHOWNA);
+        list_y += banner_h;
+    } else {
+        let _ = ShowWindow(banner_wnd, SW_HIDE);
+    }
+    let list_h = h - list_y - foot_h;
     let _ = MoveWindow(list, m, list_y, w - 2 * m, list_h.max(sc_dpi(40)), true);
-    let _ = MoveWindow(count, m, h - counth, w - 2 * m, counth - sc_dpi(2), true);
+    let _ = MoveWindow(foot_wnd, 0, h - foot_h, w, foot_h, true);
 }
 
 /// 在鼠标所在显示器的工作区居中偏上（原先固定按主屏尺寸算，多显示器时总弹在主屏）。
@@ -449,10 +568,22 @@ pub fn refresh_scopes() {
             Some(t) => t,
             None => return,
         };
-    let letters = {
+    let (letters, failed, total_files) = {
         let g = cat_arc.read();
         match g.as_ref() {
-            Some(cat) => cat.drive_letters(),
+            Some(cat) => {
+                let failed: Vec<DriveFailure> = cat
+                    .drive_statuses()
+                    .into_iter()
+                    .filter_map(|s| match s.state {
+                        DriveState::Failed { reason } => {
+                            Some(DriveFailure { letter: s.letter, reason })
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                (cat.drive_letters(), failed, cat.total_nodes())
+            }
             None => return,
         }
     };
@@ -477,6 +608,9 @@ pub fn refresh_scopes() {
         if let Some(ui) = c.borrow_mut().as_mut() {
             ui.drives = letters;
             ui.presets = presets;
+            ui.index_ready = true;
+            ui.failed = failed;
+            ui.total_files = total_files;
         }
     });
     update_combo_width();
@@ -504,51 +638,212 @@ fn selected_scope(combo: HWND) -> (Option<char>, Option<String>) {
     })
 }
 
+fn leaf_of(path: &str) -> &str {
+    let p = path.trim_end_matches('\\');
+    match p.rfind('\\') {
+        Some(i) => &p[i + 1..],
+        None => p,
+    }
+}
+
+/// 空输入页的行：最近位置和收藏，按路径去重。
+fn home_rows() -> (Vec<SearchResult>, Vec<RowTag>) {
+    let settings = ss_config::load_settings();
+    let mut rows: Vec<SearchResult> = Vec::new();
+    let mut tags = Vec::new();
+    let mut add = |path: String, tag: RowTag| {
+        if rows.iter().any(|r: &SearchResult| r.path.eq_ignore_ascii_case(&path)) {
+            return;
+        }
+        rows.push(SearchResult {
+            name: leaf_of(&path).to_string(),
+            is_dir: true,
+            match_ranges: Vec::new(),
+            path,
+        });
+        tags.push(tag);
+    };
+    if settings.popup_show_favorites {
+        for p in ss_config::favorites() {
+            add(p, RowTag::Favorite);
+        }
+    }
+    for p in ss_config::recent() {
+        add(p, RowTag::Recent);
+    }
+    (rows, tags)
+}
+
+fn to_scope(drive: Option<char>, folder: Option<String>) -> Scope {
+    match (folder, drive) {
+        (Some(f), _) => Scope::Folder(f),
+        (None, Some(d)) => Scope::Drive(d),
+        (None, None) => Scope::All,
+    }
+}
+
 fn do_search() {
-    let (edit, list, combo, count, category) = match UI.with(|c| {
+    let (edit, combo, category, cat_arc) = match UI.with(|c| {
         c.borrow()
             .as_ref()
-            .map(|u| (u.edit, u.list, u.combo, u.count, u.category))
+            .map(|u| (u.edit, u.combo, u.category, u.catalog.clone()))
     }) {
         Some(t) => t,
         None => return,
     };
     let query = get_text(edit);
-    let q = query.trim();
-    let results = if q.is_empty() {
-        Vec::new()
-    } else {
-        let (drive, folder) = selected_scope(combo);
-        let limit = ss_config::load_settings().result_limit.max(1);
-        let cat_arc = UI.with(|c| c.borrow().as_ref().map(|u| u.catalog.clone()));
-        match cat_arc {
-            Some(arc) => match arc.read().as_ref() {
-                Some(cat) => cat.search(q, drive, folder.as_deref(), category, limit),
-                None => Vec::new(),
-            },
-            None => Vec::new(),
-        }
-    };
-    let ready = UI.with(|c| c.borrow().as_ref().map(|u| u.catalog.read().is_some()).unwrap_or(false));
+    let q = query.trim().to_string();
     if q.is_empty() {
-        set_text(count, "");
-    } else if !ready {
-        set_text(count, "索引构建中…");
-    } else {
-        set_text(count, &format!("{} 个结果", results.len()));
+        let (rows, tags) = home_rows();
+        show_results(q, rows, tags, Summary::default());
+        return;
     }
+    let (drive, folder) = selected_scope(combo);
+    let settings = ss_config::load_settings();
+    let guard = cat_arc.read();
+    let Some(cat) = guard.as_ref() else {
+        drop(guard);
+        show_results(q, Vec::new(), Vec::new(), Summary::default());
+        return;
+    };
+    let resp = cat.query(&SearchRequest {
+        query: &q,
+        scope: to_scope(drive, folder),
+        category,
+        limit: settings.result_limit,
+        cancel: None,
+        exclude_dirs: &settings.exclude_dirs,
+        hide_system: settings.hide_system,
+    });
+    drop(guard);
+    let summary = Summary {
+        total_hits: resp.total_hits,
+        elapsed_ms: resp.elapsed_ms,
+        scope_problem: match resp.scope_status {
+            ScopeStatus::Ok => None,
+            ScopeStatus::FolderMissing => Some(ScopeProblem::FolderMissing),
+            ScopeStatus::DriveNotIndexed => Some(ScopeProblem::DriveNotIndexed),
+        },
+    };
+    show_results(q, resp.items, Vec::new(), summary);
+}
+
+/// 显示一次搜索的结果。
+fn show_results(query: String, items: Vec<SearchResult>, tags: Vec<RowTag>, summary: Summary) {
+    let Some(list) = UI.with(|c| c.borrow().as_ref().map(|u| u.list)) else {
+        return;
+    };
+    let extra_h = if query.is_empty() { sc_dpi(16) + sc_dpi(22) * (HINTS.len() as i32 + 1) } else { 0 };
     UI.with(|c| {
         if let Some(ui) = c.borrow_mut().as_mut() {
-            ui.results = Rc::new(results);
+            ui.results = Rc::new(items);
+            ui.row_tags = tags;
+            ui.query_text = query;
+            ui.summary = summary;
+            ui.extra_h = extra_h;
             ui.scroll_y = 0.0;
             ui.target_y = 0.0;
             ui.sel = if ui.results.is_empty() { -1 } else { 0 };
             ui.hover = -1;
         }
     });
+    refresh_view();
     unsafe {
         update_scrollbar(list);
+    }
+}
+
+/// 按当前状态重新计算主体内容、横幅和状态栏，并重绘。
+fn refresh_view() {
+    let Some((search, combo, list, banner_wnd, foot_wnd)) = UI.with(|c| {
+        c.borrow().as_ref().map(|u| (u.search_hwnd, u.combo, u.list, u.banner_wnd, u.foot_wnd))
+    }) else {
+        return;
+    };
+    let (drive, folder) = selected_scope(combo);
+    let label = match (&folder, drive) {
+        (Some(f), _) => f.clone(),
+        (None, Some(d)) => format!("{d} 盘"),
+        (None, None) => UI.with(|c| {
+            c.borrow().as_ref().map(|u| all_drives_label(&u.drives)).unwrap_or_default()
+        }),
+    };
+    let scope_is_all = folder.is_none() && drive.is_none();
+    let building = BUILDING.lock().clone();
+    let banner_changed = UI.with(|c| {
+        let mut b = c.borrow_mut();
+        let Some(ui) = b.as_mut() else {
+            return false;
+        };
+        let input = ViewInput {
+            query_empty: ui.query_text.is_empty(),
+            index_ready: ui.index_ready,
+            scope_problem: ui.summary.scope_problem,
+            shown: ui.results.len(),
+            total_hits: ui.summary.total_hits,
+            scope_is_all,
+            category_is_all: ui.category == Category::All,
+            failed: &ui.failed,
+            building: &building,
+            scope_label: &label,
+            elapsed_ms: ui.summary.elapsed_ms,
+            total_files: ui.total_files,
+            synced_secs_ago: crate::synced_secs_ago(),
+        };
+        let new_body = body(&input);
+        let new_banner = banner(&input);
+        let status = status_line(&input);
+        let changed = new_banner.is_some() != ui.view_banner.is_some();
+        ui.view_body = new_body;
+        ui.view_banner = new_banner;
+        ui.status = status;
+        changed
+    });
+    unsafe {
+        if banner_changed {
+            layout(search);
+        }
         let _ = InvalidateRect(Some(list), None, false);
+        let _ = InvalidateRect(Some(banner_wnd), None, false);
+        let _ = InvalidateRect(Some(foot_wnd), None, false);
+    }
+}
+
+/// 响应横幅或空状态里的操作。
+fn run_act(act: Act) {
+    let Some((combo, cats, failed)) = UI.with(|c| {
+        c.borrow().as_ref().map(|u| {
+            (u.combo, u.cats.clone(), u.failed.iter().map(|f| f.letter).collect::<Vec<char>>())
+        })
+    }) else {
+        return;
+    };
+    match act {
+        Act::SearchAllScopes => {
+            send(combo, CB_SETCURSEL, 0, 0);
+            update_combo_width();
+            do_search();
+        }
+        Act::ClearCategory => {
+            UI.with(|c| {
+                if let Some(ui) = c.borrow_mut().as_mut() {
+                    ui.category = Category::All;
+                }
+            });
+            for b in cats {
+                let _ = unsafe { InvalidateRect(Some(b), None, true) };
+            }
+            do_search();
+        }
+        Act::RemovePreset => {
+            if let (_, Some(folder)) = selected_scope(combo) {
+                let _ = ss_config::update_settings(|s| s.preset_folders.retain(|f| f != &folder));
+            }
+            refresh_scopes();
+        }
+        Act::RetryFailedDrives => {
+            crate::rebuild_drives(failed);
+        }
     }
 }
 
@@ -766,13 +1061,13 @@ unsafe fn draw_cat_button(dis: &DRAWITEMSTRUCT) {
 fn geometry(list: HWND) -> ListGeometry {
     let mut rc = RECT::default();
     let _ = unsafe { GetClientRect(list, &mut rc) };
-    let (count, item_h) = UI.with(|c| {
+    let (count, item_h, extra_h) = UI.with(|c| {
         c.borrow()
             .as_ref()
-            .map(|u| (u.results.len() as i32, u.item_h))
-            .unwrap_or((0, 46))
+            .map(|u| (u.results.len() as i32, u.item_h, u.extra_h))
+            .unwrap_or((0, 46, 0))
     });
-    ListGeometry { count, item_h, view_h: rc.bottom - rc.top, extra_h: 0 }
+    ListGeometry { count, item_h, view_h: rc.bottom - rc.top, extra_h }
 }
 
 unsafe fn update_scrollbar(list: HWND) {
@@ -874,7 +1169,8 @@ fn ensure_visible(list: HWND, idx: i32) {
     }
 }
 
-unsafe fn draw_one(hdc: HDC, rect: RECT, r: &SearchResult, selected: bool, hover: bool, t: &Theme, fname: HFONT, fpath: HFONT) {
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_one(hdc: HDC, rect: RECT, r: &SearchResult, tag: Option<RowTag>, selected: bool, hover: bool, t: &Theme, fname: HFONT, fpath: HFONT, ficon: HFONT) {
     let bg = if selected {
         t.sel_bg
     } else if hover {
@@ -893,17 +1189,29 @@ unsafe fn draw_one(hdc: HDC, rect: RECT, r: &SearchResult, selected: bool, hover
     }
     SetBkMode(hdc, TRANSPARENT);
     let tx = rect.left + pad + icon + pad;
+    let right = if tag.is_some() { rect.right - sc_dpi(44) } else { rect.right - pad };
+    match tag {
+        Some(RowTag::Favorite) => {
+            let mut tr = RECT { left: right, top: rect.top, right: rect.right - pad, bottom: rect.bottom };
+            draw_text(hdc, "\u{E735}", &mut tr, t.star, ficon, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        }
+        Some(RowTag::Recent) => {
+            let mut tr = RECT { left: right, top: rect.top, right: rect.right - pad, bottom: rect.bottom };
+            draw_text(hdc, "最近", &mut tr, path_fg, fpath, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        }
+        None => {}
+    }
     let mut r1 = RECT {
         left: tx,
         top: rect.top + sc_dpi(4),
-        right: rect.right - pad,
+        right,
         bottom: rect.top + (rect.bottom - rect.top) / 2 + sc_dpi(2),
     };
     draw_text(hdc, &r.name, &mut r1, fg, fname, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
     let mut r2 = RECT {
         left: tx,
         top: rect.top + (rect.bottom - rect.top) / 2 - sc_dpi(2),
-        right: rect.right - pad,
+        right,
         bottom: rect.bottom - sc_dpi(2),
     };
     draw_text(hdc, &r.path, &mut r2, path_fg, fpath, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -916,17 +1224,32 @@ unsafe fn paint_list(list: HWND) {
     let _ = GetClientRect(list, &mut rc);
     let t = theme::current();
     let g = geometry(list);
-    let (scroll_y, sel, hover, fname, fpath) = UI.with(|c| {
+    let null_font = HFONT(std::ptr::null_mut());
+    let (scroll_y, sel, hover, fname, fpath, ficon, view_body) = UI.with(|c| {
         c.borrow()
             .as_ref()
-            .map(|u| (u.scroll_y, u.sel, u.hover, u.font_name, u.font_path))
-            .unwrap_or((0.0, -1, -1, HFONT(std::ptr::null_mut()), HFONT(std::ptr::null_mut())))
+            .map(|u| (u.scroll_y, u.sel, u.hover, u.font_name, u.font_path, u.font_icon, u.view_body))
+            .unwrap_or((0.0, -1, -1, null_font, null_font, null_font, Body::Home))
     });
     let full = rc;
     paint::buffered(hdc, full, |mem, lrc| unsafe {
         FillRect(mem, &lrc, theme::solid_brush(t.bg));
-        let results = UI.with(|c| c.borrow().as_ref().map(|u| u.results.clone()));
-        let Some(results) = results else {
+        SetBkMode(mem, TRANSPARENT);
+        if let Some(hits) = paint_message(mem, lrc, view_body, &t, fname, fpath) {
+            UI.with(|c| {
+                if let Some(u) = c.borrow_mut().as_mut() {
+                    u.list_hits = hits;
+                }
+            });
+            return;
+        }
+        UI.with(|c| {
+            if let Some(u) = c.borrow_mut().as_mut() {
+                u.list_hits.clear();
+            }
+        });
+        let rows = UI.with(|c| c.borrow().as_ref().map(|u| (u.results.clone(), u.row_tags.clone())));
+        let Some((results, tags)) = rows else {
             return;
         };
         if let Some((first, last)) = g.visible(scroll_y) {
@@ -940,12 +1263,191 @@ unsafe fn paint_list(list: HWND) {
                     bottom: y + g.item_h,
                 };
                 if let Some(r) = results.get(i as usize) {
-                    draw_one(mem, item_rect, r, i == sel, i == hover, &t, fname, fpath);
+                    let tag = tags.get(i as usize).copied();
+                    draw_one(mem, item_rect, r, tag, i == sel, i == hover, &t, fname, fpath, ficon);
                 }
             }
         }
+        if view_body == Body::Home {
+            paint_hints(mem, lrc, g.count * g.item_h - scroll_y as i32, &t, fname, fpath);
+        }
     });
     let _ = EndPaint(list, &ps);
+}
+
+/// 列表区域的提示文字（索引中、范围失效、无结果）。不是这些状态时返回 `None`。
+/// 返回的是可点击按钮的区域。
+unsafe fn paint_message(hdc: HDC, rc: RECT, view: Body, t: &Theme, ftitle: HFONT, fsub: HFONT) -> Option<Vec<(RECT, Act)>> {
+    let query = UI.with(|c| c.borrow().as_ref().map(|u| u.query_text.clone()).unwrap_or_default());
+    let (title, sub, actions): (String, &str, Vec<(&str, Act)>) = match view {
+        Body::Home | Body::Results => return None,
+        Body::Indexing => ("索引建立中".to_string(), "完成后会自动显示结果。", Vec::new()),
+        Body::ScopeInvalid => {
+            ("无法搜索这个范围".to_string(), "它可能已被删除或改名。", vec![("搜索全部盘", Act::SearchAllScopes)])
+        }
+        Body::NoResults { offer_all_scopes, offer_clear_category } => {
+            let mut acts = Vec::new();
+            if offer_all_scopes {
+                acts.push(("搜索全部盘", Act::SearchAllScopes));
+            }
+            if offer_clear_category {
+                acts.push(("清除分类", Act::ClearCategory));
+            }
+            (format!("没有找到“{query}”"), "可以换个关键字，或扩大搜索范围。", acts)
+        }
+    };
+    let flags = DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
+    let top = rc.top + sc_dpi(48);
+    let mut r = RECT { left: rc.left + sc_dpi(16), top, right: rc.right - sc_dpi(16), bottom: top + sc_dpi(26) };
+    draw_text(hdc, &title, &mut r, t.fg, ftitle, flags);
+    let mut r = RECT { left: rc.left + sc_dpi(16), top: top + sc_dpi(26), right: rc.right - sc_dpi(16), bottom: top + sc_dpi(50) };
+    draw_text(hdc, sub, &mut r, t.path_fg, fsub, flags);
+
+    let gap = sc_dpi(8);
+    let pad = sc_dpi(14);
+    let widths: Vec<i32> = actions.iter().map(|(l, _)| measure_text(fsub, l) + pad * 2).collect();
+    let total: i32 = widths.iter().sum::<i32>() + gap * (widths.len() as i32 - 1).max(0);
+    let mut x = (rc.right - rc.left - total) / 2;
+    let y = top + sc_dpi(62);
+    let mut hits = Vec::new();
+    for (i, ((label, act), w)) in actions.iter().zip(&widths).enumerate() {
+        let b = RECT { left: x, top: y, right: x + w, bottom: y + sc_dpi(26) };
+        let primary = i == 0;
+        FillRect(hdc, &b, theme::solid_brush(if primary { t.accent } else { t.bg }));
+        FrameRect(hdc, &b, theme::solid_brush(if primary { t.accent } else { t.border }));
+        let mut lr = b;
+        draw_text(hdc, label, &mut lr, if primary { t.accent_fg } else { t.fg }, fsub, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        hits.push((b, *act));
+        x += w + gap;
+    }
+    Some(hits)
+}
+
+/// 空输入页底部的语法提示。
+unsafe fn paint_hints(hdc: HDC, rc: RECT, top: i32, t: &Theme, fname: HFONT, fsub: HFONT) {
+    let line = sc_dpi(22);
+    let left = rc.left + sc_dpi(8);
+    let flags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
+    let mut y = top + sc_dpi(16);
+    let mut r = RECT { left, top: y, right: rc.right - sc_dpi(8), bottom: y + line };
+    draw_text(hdc, "搜索语法", &mut r, t.fg, fname, flags);
+    let code_w = sc_dpi(130);
+    for (code, desc) in HINTS {
+        y += line;
+        let mut r = RECT { left, top: y, right: left + code_w, bottom: y + line };
+        draw_text(hdc, code, &mut r, t.fg, fsub, flags);
+        let mut r = RECT { left: left + code_w, top: y, right: rc.right - sc_dpi(8), bottom: y + line };
+        draw_text(hdc, desc, &mut r, t.path_fg, fsub, flags);
+    }
+}
+
+/// 横幅和状态栏的绘制。
+unsafe fn paint_strip(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    let t = theme::current();
+    let state = UI.with(|c| {
+        c.borrow().as_ref().map(|u| (u.foot_wnd, u.view_banner.clone(), u.status.clone(), u.font_path))
+    });
+    if let Some((foot_wnd, view_banner, status, font)) = state {
+        paint::buffered(hdc, rc, |mem, lrc| unsafe {
+            SetBkMode(mem, TRANSPARENT);
+            if hwnd == foot_wnd {
+                paint_foot(mem, lrc, &status, &t, font);
+            } else if let Some(b) = &view_banner {
+                let hits = paint_banner(mem, lrc, b, &t, font);
+                UI.with(|c| {
+                    if let Some(u) = c.borrow_mut().as_mut() {
+                        u.banner_hits = hits;
+                    }
+                });
+            }
+        });
+    }
+    let _ = EndPaint(hwnd, &ps);
+}
+
+unsafe fn paint_foot(hdc: HDC, rc: RECT, status: &str, t: &Theme, font: HFONT) {
+    FillRect(hdc, &rc, theme::solid_brush(t.alt_bg));
+    let line = RECT { left: rc.left, top: rc.top, right: rc.right, bottom: rc.top + 1 };
+    FillRect(hdc, &line, theme::solid_brush(t.border));
+    let mut r = RECT { left: rc.left + sc_dpi(14), top: rc.top, right: rc.right - sc_dpi(14), bottom: rc.bottom };
+    draw_text(hdc, status, &mut r, t.path_fg, font, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+}
+
+unsafe fn paint_banner(hdc: HDC, rc: RECT, b: &Banner, t: &Theme, font: HFONT) -> Vec<(RECT, Act)> {
+    let (text, bg, fg, permille, actions): (&str, u32, u32, Option<u16>, Vec<(&str, Act)>) = match b {
+        Banner::Indexing { text, permille } => (text, t.warn_bg, t.warn, *permille, Vec::new()),
+        Banner::Truncated { text } => (text, t.warn_bg, t.warn, None, Vec::new()),
+        Banner::DriveFailed { text } => (text, t.err_bg, t.err, None, vec![("重试", Act::RetryFailedDrives)]),
+        Banner::ScopeInvalid { text } => (
+            text,
+            t.err_bg,
+            t.err,
+            None,
+            vec![("改搜全部盘", Act::SearchAllScopes), ("从预设中移除", Act::RemovePreset)],
+        ),
+    };
+    FillRect(hdc, &rc, theme::solid_brush(bg));
+    let pad = sc_dpi(14);
+    let gap = sc_dpi(12);
+    let mut right = rc.right - pad;
+    let mut hits = Vec::new();
+    for (label, act) in actions.iter().rev() {
+        let w = measure_text(font, label);
+        let r = RECT { left: right - w, top: rc.top, right, bottom: rc.bottom };
+        let mut lr = r;
+        draw_text(hdc, label, &mut lr, t.accent, font, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        hits.push((r, *act));
+        right -= w + gap;
+    }
+    let mut tr = RECT { left: rc.left + pad, top: rc.top, right, bottom: rc.bottom };
+    draw_text(hdc, text, &mut tr, fg, font, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+    if let Some(p) = permille {
+        let h = sc_dpi(3);
+        let track = RECT { left: rc.left, top: rc.bottom - h, right: rc.right, bottom: rc.bottom };
+        FillRect(hdc, &track, theme::solid_brush(t.border));
+        let w = (rc.right - rc.left) * p as i32 / 1000;
+        let fill = RECT { left: rc.left, top: rc.bottom - h, right: rc.left + w, bottom: rc.bottom };
+        FillRect(hdc, &fill, theme::solid_brush(t.accent));
+    }
+    hits
+}
+
+fn act_at(hits: &[(RECT, Act)], x: i32, y: i32) -> Option<Act> {
+    hits.iter()
+        .find(|(r, _)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+        .map(|(_, a)| *a)
+}
+
+unsafe extern "system" fn strip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            paint_strip(hwnd);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let x = (lp.0 & 0xFFFF) as i16 as i32;
+            let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+            let act = UI.with(|c| {
+                c.borrow().as_ref().and_then(|u| {
+                    if hwnd == u.banner_wnd {
+                        act_at(&u.banner_hits, x, y)
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some(act) = act {
+                run_act(act);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
 }
 
 fn y_to_index(list: HWND, y: i32) -> i32 {
@@ -1020,11 +1522,16 @@ unsafe extern "system" fn results_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
+            let x = (lp.0 & 0xFFFF) as i16 as i32;
             let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
             let idx = y_to_index(hwnd, y);
             // 焦点交还搜索框，保证可继续打字；点击只改选中
             if let Some(edit) = UI.with(|c| c.borrow().as_ref().map(|u| u.edit)) {
                 let _ = SetFocus(Some(edit));
+            }
+            if let Some(act) = UI.with(|c| c.borrow().as_ref().and_then(|u| act_at(&u.list_hits, x, y))) {
+                run_act(act);
+                return LRESULT(0);
             }
             if idx >= 0 {
                 UI.with(|c| {
@@ -1105,6 +1612,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             refresh_scopes();
             LRESULT(0)
         }
+        WM_APP_INDEX_PROGRESS => {
+            refresh_view();
+            LRESULT(0)
+        }
         WM_DRAWITEM => {
             let dis = &*(lp.0 as *const DRAWITEMSTRUCT);
             if dis.CtlID == COMBO_ID {
@@ -1126,7 +1637,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let hdc = HDC(wp.0 as *mut c_void);
             SetTextColor(hdc, COLORREF(t.fg));
             SetBkMode(hdc, TRANSPARENT);
-            let bg = if msg == WM_CTLCOLORSTATIC { t.bg } else { t.alt_bg };
+            let bg = if msg == WM_CTLCOLORLISTBOX { t.alt_bg } else { t.bg };
             return LRESULT(theme::solid_brush(bg).0 as isize);
         }
         WM_ERASEBKGND => {
