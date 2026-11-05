@@ -33,6 +33,7 @@ pub struct Theme {
     pub err: u32,
     pub err_bg: u32,
     pub star: u32,
+    pub mark: u32,
 }
 
 const LIGHT: Theme = Theme {
@@ -50,6 +51,7 @@ const LIGHT: Theme = Theme {
     err: rgb(0xA3, 0x26, 0x26),
     err_bg: rgb(0xFD, 0xEA, 0xEA),
     star: rgb(0xE8, 0xA3, 0x17),
+    mark: rgb(0xFF, 0xE9, 0x9A),
 };
 
 thread_local! {

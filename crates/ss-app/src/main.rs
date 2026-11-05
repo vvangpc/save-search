@@ -7,6 +7,7 @@
 
 mod dlgpopup;
 mod icons;
+mod meta;
 mod paint;
 mod search_worker;
 mod searchwin;
@@ -334,6 +335,7 @@ fn main() -> windows::core::Result<()> {
         let search_hwnd = searchwin::init(catalog.clone())?;
         SEARCH_HWND.store(search_hwnd.0 as isize, Ordering::Relaxed);
         icons::start(|| post_to_search(searchwin::WM_APP_ICONS_READY));
+        meta::start(|| post_to_search(searchwin::WM_APP_META_READY));
         {
             let catalog2 = catalog.clone();
             let cache2 = cache_dir.clone();
