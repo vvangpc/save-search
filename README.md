@@ -27,6 +27,7 @@
 - [数据目录](#数据目录)
 - [从源码构建](#从源码构建)
 - [已知限制与路线图](#已知限制与路线图)
+- [更新日志](CHANGELOG.md)
 
 ## 功能
 
@@ -177,8 +178,8 @@ python tools/make_icon.py
 - 推送 `vX.Y.Z` tag 自动创建 **GitHub Release**，附 `ss-app.exe` 与 zip。
 
 ```powershell
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 ## 已知限制与路线图
