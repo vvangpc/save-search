@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::category::Category;
+use crate::category::{Category, CategoryCounts};
 use crate::drives::ntfs_fixed_drives;
 use crate::index::{compile_query, Change, Index, ScanSpec, ScoreKey, SearchResult};
 use crate::mft::{build_index_for_drive, current_usn_state, read_changes};
@@ -48,6 +48,8 @@ pub struct SearchResponse {
     pub total_hits: usize,
     /// `total_hits > items.len()`。
     pub truncated: bool,
+    /// 不看分类筛选时各分类的命中数，用于在分类标签上显示。
+    pub category_counts: CategoryCounts,
     pub scope_status: ScopeStatus,
     pub cancelled: bool,
     pub elapsed_ms: u32,
@@ -291,21 +293,23 @@ impl Catalog {
     /// 执行一次搜索：各盘全量扫描 → 全局排序 → 取前 `limit` → 只为前 `limit` 条还原字符串。
     pub fn query(&self, req: &SearchRequest) -> SearchResponse {
         let started = Instant::now();
-        let terms = compile_query(req.query);
+        let compiled = compile_query(req.query);
         let (scope_status, targets) = self.resolve_scope(&req.scope);
 
         let mut merged: Vec<(ScoreKey, usize, u32)> = Vec::new();
         let mut total_hits = 0usize;
+        let mut category_counts = CategoryCounts::default();
         let mut cancelled = false;
         for (di, ancestor) in targets {
             let scan = self.indexes[di].scan_sorted(&ScanSpec {
-                terms: &terms,
+                query: &compiled,
                 category: req.category,
                 ancestor,
                 limit: req.limit,
                 cancel: req.cancel,
             });
             total_hits += scan.total_hits;
+            category_counts.merge(&scan.category_counts);
             merged.extend(scan.hits.into_iter().map(|(k, id)| (k, di, id)));
             if scan.cancelled {
                 cancelled = true;
@@ -316,11 +320,12 @@ impl Catalog {
         merged.truncate(req.limit);
         let items: Vec<SearchResult> = merged
             .into_iter()
-            .map(|(_, di, id)| self.indexes[di].materialize(id, &terms))
+            .map(|(_, di, id)| self.indexes[di].materialize(id, &compiled))
             .collect();
 
         SearchResponse {
             truncated: total_hits > items.len(),
+            category_counts,
             items,
             total_hits,
             scope_status,
@@ -399,6 +404,17 @@ mod tests {
         let d = cat.query(&req("report", Scope::Drive('d')));
         assert_eq!(d.items[0].path, "D:\\Work\\report_d.txt");
         assert_eq!(d.total_hits, 1);
+    }
+
+    #[test]
+    fn query_merges_category_counts_across_drives() {
+        let cat = sample_catalog();
+        let mut r = req("report", Scope::All);
+        r.category = Category::Image;
+        let resp = cat.query(&r);
+        assert_eq!(resp.total_hits, 0);
+        assert_eq!(resp.category_counts.get(Category::Document), 2);
+        assert_eq!(resp.category_counts.get(Category::All), 2);
     }
 
     #[test]

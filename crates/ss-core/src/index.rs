@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-use crate::category::Category;
+use crate::category::{classify, ext_of, Category, CategoryCounts};
 
 /// 节点标志位。
 pub const IS_DIR: u16 = 1 << 0;
@@ -112,22 +112,62 @@ pub(crate) struct CompiledTerm {
     anchor_end: bool,
 }
 
-/// 把原始查询编译为词列表：按 Unicode 空白分词（含全角空格 U+3000），每词预折叠小写
-/// 并标记通配符。空白不产生空词；空查询返回空 Vec。
-pub(crate) fn compile_query(query: &str) -> Vec<CompiledTerm> {
-    query
-        .split_whitespace()
-        .map(|w| {
-            let lower: Vec<u8> = w.bytes().map(|b| b.to_ascii_lowercase()).collect();
-            let has_wild = lower.iter().any(|&b| b == b'*' || b == b'?');
-            let anchor_end = lower.first() == Some(&b'*') && lower.last() != Some(&b'*');
-            CompiledTerm {
-                lower,
-                has_wild,
-                anchor_end,
-            }
-        })
-        .collect()
+/// 编译后的查询。
+#[derive(Default)]
+pub(crate) struct CompiledQuery {
+    /// 匹配文件名的词，全部命中才算匹配（AND）。
+    pub terms: Vec<CompiledTerm>,
+    /// 含 `\\` 的词，匹配完整路径。只有这时才需要拼路径，普通搜索不受影响。
+    pub path_terms: Vec<CompiledTerm>,
+    /// `ext:pdf,docx`：扩展名白名单（已小写，不含点）。
+    pub exts: Vec<Vec<u8>>,
+    /// `dir:`：只要文件夹。
+    pub dirs_only: bool,
+}
+
+impl CompiledQuery {
+    /// 没有任何条件。这样的查询没有结果，而不是匹配全部节点。
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty() && self.path_terms.is_empty() && self.exts.is_empty() && !self.dirs_only
+    }
+}
+
+fn compile_term(word: &str) -> CompiledTerm {
+    let lower = word.as_bytes().to_ascii_lowercase();
+    let has_wild = lower.iter().any(|&b| b == b'*' || b == b'?');
+    let anchor_end = lower.first() == Some(&b'*') && lower.last() != Some(&b'*');
+    CompiledTerm {
+        lower,
+        has_wild,
+        anchor_end,
+    }
+}
+
+/// 解析查询：按 Unicode 空白分词（含全角空格 U+3000）。`ext:a,b` 和单独的 `dir:` 是筛选
+/// 条件，含 `\\` 的词匹配完整路径，其余的词匹配文件名。
+pub(crate) fn compile_query(query: &str) -> CompiledQuery {
+    let mut q = CompiledQuery::default();
+    for word in query.split_whitespace() {
+        let ext_list = word
+            .get(..4)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("ext:"))
+            .map(|_| &word[4..])
+            .filter(|list| !list.is_empty());
+        if let Some(list) = ext_list {
+            q.exts.extend(
+                list.split(',')
+                    .map(|e| e.trim_start_matches('.').as_bytes().to_ascii_lowercase())
+                    .filter(|e| !e.is_empty()),
+            );
+        } else if word.eq_ignore_ascii_case("dir:") {
+            q.dirs_only = true;
+        } else if word.contains('\\') {
+            q.path_terms.push(compile_term(word));
+        } else {
+            q.terms.push(compile_term(word));
+        }
+    }
+    q
 }
 
 /// 单个词是否命中文件名：无通配=子串匹配（复用 `contains_ci`）；含通配=子串锚定 glob。
@@ -325,7 +365,7 @@ impl ScoreKey {
 /// 一次扫描的条件。
 #[derive(Clone, Copy)]
 pub(crate) struct ScanSpec<'a> {
-    pub terms: &'a [CompiledTerm],
+    pub query: &'a CompiledQuery,
     pub category: Category,
     /// 只取该目录子树内的节点。
     pub ancestor: Option<u32>,
@@ -340,7 +380,10 @@ const CANCEL_CHECK_MASK: u32 = 4096 - 1;
 #[derive(Default)]
 pub(crate) struct Scan {
     pub hits: Vec<(ScoreKey, u32)>,
+    /// 符合全部条件的命中数。
     pub total_hits: usize,
+    /// 不看分类筛选时，各分类的命中数。
+    pub category_counts: CategoryCounts,
     pub cancelled: bool,
 }
 
@@ -592,6 +635,26 @@ impl Index {
         self.flags[id as usize] & IS_DELETED != 0
     }
 
+    /// 把完整路径的 UTF-8 字节写进 `buf`（复用其容量），用于路径匹配。
+    fn write_path(&self, id: u32, buf: &mut Vec<u8>) {
+        let mut stack = [ROOT_ID; 256];
+        let mut depth = 0usize;
+        let mut cur = id;
+        while cur != u32::MAX && cur != ROOT_ID && depth < stack.len() {
+            stack[depth] = cur;
+            depth += 1;
+            cur = self.parent[cur as usize];
+        }
+        buf.clear();
+        buf.extend_from_slice(&[self.drive_letter, b':', b'\\']);
+        for (i, &node) in stack[..depth].iter().rev().enumerate() {
+            if i > 0 {
+                buf.push(b'\\');
+            }
+            buf.extend_from_slice(self.name_bytes(node));
+        }
+    }
+
     pub fn path(&self, id: u32) -> String {
         let mut parts: Vec<&[u8]> = Vec::new();
         let mut cur = id;
@@ -644,7 +707,7 @@ impl Index {
     /// 比堆顶差的命中不计算深度、不分配小写名，所以泛查询的开销主要在名字匹配上。
     fn collect_range(&self, lo: u32, hi: u32, spec: &ScanSpec) -> Scan {
         let ScanSpec {
-            terms,
+            query,
             category,
             ancestor,
             limit,
@@ -652,9 +715,12 @@ impl Index {
         } = *spec;
         let mut heap: BinaryHeap<(ScoreKey, u32)> = BinaryHeap::new();
         let mut total_hits = 0usize;
+        let mut category_counts = CategoryCounts::default();
         let mut cancelled = false;
-        // 只有「单词且无通配」才可能构成完全/前缀匹配（多词或含通配恒不算）。
+        let terms = query.terms.as_slice();
+        // 只有「单词且无通配」才可能构成完全匹配（多词或含通配恒不算）。
         let single_plain = terms.len() == 1 && !terms[0].has_wild;
+        let mut path_buf: Vec<u8> = Vec::new();
         for id in lo..hi {
             if (id - lo) & CANCEL_CHECK_MASK == 0
                 && cancel.is_some_and(|c| c.load(AtomicOrdering::Relaxed))
@@ -670,24 +736,41 @@ impl Index {
                 continue;
             }
             let is_dir = self.is_dir(id);
-            if !crate::category::matches(category, nb, is_dir) {
+            if query.dirs_only && !is_dir {
                 continue;
+            }
+            if !query.exts.is_empty() {
+                let ext = ext_of(nb);
+                if is_dir || !query.exts.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
+                    continue;
+                }
             }
             if let Some(anc) = ancestor {
                 if !self.is_descendant(id, anc) {
                     continue;
                 }
             }
+            if !query.path_terms.is_empty() {
+                self.write_path(id, &mut path_buf);
+                if !all_terms_match(&path_buf, &query.path_terms) {
+                    continue;
+                }
+            }
+            let item_category = classify(nb, is_dir);
+            category_counts.add_hit(item_category);
+            if category != Category::All && category != item_category {
+                continue;
+            }
             total_hits += 1;
             if limit == 0 {
                 continue;
             }
 
-            let first = &terms[0];
-            let not_exact = !(single_plain && nb.eq_ignore_ascii_case(&first.lower));
+            let first = terms.first();
+            let not_exact = !(single_plain && nb.eq_ignore_ascii_case(&terms[0].lower));
             let not_stem_exact =
-                !(single_plain && stem_of(nb, is_dir).eq_ignore_ascii_case(&first.lower));
-            let not_prefix = first.has_wild || !starts_with_ci(nb, &first.lower);
+                !(single_plain && stem_of(nb, is_dir).eq_ignore_ascii_case(&terms[0].lower));
+            let not_prefix = first.is_none_or(|t| t.has_wild || !starts_with_ci(nb, &t.lower));
             let not_dir = !is_dir;
             let cheap = (not_exact, not_stem_exact, not_prefix, not_dir);
 
@@ -721,13 +804,14 @@ impl Index {
         Scan {
             hits: heap.into_vec(),
             total_hits,
+            category_counts,
             cancelled,
         }
     }
 
     /// 全量扫描。大索引按 id 区间切成多段并行（作用域线程，每次搜索建/收线程约几十微秒，
     /// 远小于扫描本身），每段独立保留前 `limit` 条。全局前 `limit` 条一定在各段前
-    /// `limit` 条的并集里。`terms` 须非空（由调用方保证）。
+    /// `limit` 条的并集里。查询须非空（由调用方保证）。
     fn collect_scored(&self, spec: &ScanSpec) -> Scan {
         let n = self.names_len.len();
         let threads = if n >= PAR_MIN_NODES {
@@ -755,6 +839,7 @@ impl Index {
                 let part = h.join().unwrap_or_default();
                 out.hits.extend(part.hits);
                 out.total_hits += part.total_hits;
+                out.category_counts.merge(&part.category_counts);
                 out.cancelled |= part.cancelled;
             }
             out
@@ -762,12 +847,12 @@ impl Index {
     }
 
     /// 由 id 还原一条搜索结果（建 name/path 字符串，计算命中区间）。
-    pub(crate) fn materialize(&self, id: u32, terms: &[CompiledTerm]) -> SearchResult {
+    pub(crate) fn materialize(&self, id: u32, query: &CompiledQuery) -> SearchResult {
         SearchResult {
             name: self.name(id),
             path: self.path(id),
             is_dir: self.is_dir(id),
-            match_ranges: match_ranges(self.name_bytes(id), terms),
+            match_ranges: match_ranges(self.name_bytes(id), &query.terms),
         }
     }
 
@@ -780,9 +865,9 @@ impl Index {
         ancestor: Option<u32>,
         limit: usize,
     ) -> Vec<SearchResult> {
-        let terms = compile_query(query);
+        let compiled = compile_query(query);
         let scan = self.scan_sorted(&ScanSpec {
-            terms: &terms,
+            query: &compiled,
             category,
             ancestor,
             limit,
@@ -790,14 +875,14 @@ impl Index {
         });
         scan.hits
             .into_iter()
-            .map(|(_, id)| self.materialize(id, &terms))
+            .map(|(_, id)| self.materialize(id, &compiled))
             .collect()
     }
 
     /// 供多盘合并：返回单盘已排序并截到 `limit` 的结果，不还原字符串。
     /// 全局 top-limit ⊆ 各盘 top-limit 的并集，故先截可减少合并量。空查询返回空。
     pub(crate) fn scan_sorted(&self, spec: &ScanSpec) -> Scan {
-        if spec.terms.is_empty() {
+        if spec.query.is_empty() {
             return Scan::default();
         }
         let mut scan = self.collect_scored(spec);
@@ -1119,7 +1204,7 @@ mod tests {
         b.push(100, 5, 0, "报告 2024.txt");
         b.push(101, 5, 0, "报告.txt");
         let idx = b.finish();
-        assert_eq!(compile_query("报告\u{3000}2024").len(), 2);
+        assert_eq!(compile_query("报告\u{3000}2024").terms.len(), 2);
         let r = idx.search("2024\u{3000}报告", Category::All, 10);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].name, "报告 2024.txt");
@@ -1301,9 +1386,9 @@ mod tests {
         assert!(!idx.needs_rebuild());
     }
 
-    fn spec(terms: &[CompiledTerm], limit: usize) -> ScanSpec<'_> {
+    fn spec(query: &CompiledQuery, limit: usize) -> ScanSpec<'_> {
         ScanSpec {
-            terms,
+            query,
             category: Category::All,
             ancestor: None,
             limit,
@@ -1313,7 +1398,7 @@ mod tests {
 
     #[test]
     fn match_ranges_cover_terms_in_name_bytes() {
-        let ranges = |name: &str, q: &str| match_ranges(name.as_bytes(), &compile_query(q));
+        let ranges = |name: &str, q: &str| match_ranges(name.as_bytes(), &compile_query(q).terms);
         assert_eq!(ranges("Report.TXT", "report"), [(0, 6)]);
         assert_eq!(ranges("Report.TXT", "txt rep"), [(0, 3), (7, 10)]);
         // 相邻和重叠的区间会合并
@@ -1329,6 +1414,70 @@ mod tests {
         b.push(100, 5, 0, "报告.txt");
         let idx = b.finish();
         assert_eq!(idx.search("告", Category::All, 1)[0].match_ranges, [(3, 6)]);
+    }
+
+    fn syntax_index() -> Index {
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, FILE_ATTRIBUTE_DIRECTORY, "工作");
+        b.push(101, 100, FILE_ATTRIBUTE_DIRECTORY, "报告");
+        b.push(200, 101, 0, "年度.PDF");
+        b.push(201, 100, 0, "报告.docx");
+        b.push(202, 5, 0, "报告.pdf");
+        b.push(203, 5, 0, "song.mp3");
+        b.push(204, 5, 0, "setup.exe");
+        b.finish()
+    }
+
+    fn search_names(idx: &Index, q: &str) -> Vec<String> {
+        let mut v: Vec<String> =
+            idx.search(q, Category::All, 50).into_iter().map(|r| r.name).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn ext_and_dir_filters() {
+        let idx = syntax_index();
+        assert_eq!(search_names(&idx, "ext:pdf"), ["年度.PDF", "报告.pdf"]);
+        assert_eq!(search_names(&idx, "EXT:PDF,.docx 报告"), ["报告.docx", "报告.pdf"]);
+        assert_eq!(search_names(&idx, "dir:"), ["工作", "报告"]);
+        assert_eq!(search_names(&idx, "dir: 报告"), ["报告"]);
+        // 文件夹没有扩展名，ext: 不选中文件夹
+        assert!(search_names(&idx, "dir: ext:pdf").is_empty());
+        // 不完整的语法按普通词处理（冒号不能出现在文件名里，所以没有结果）
+        assert!(search_names(&idx, "ext:").is_empty());
+        assert!(search_names(&idx, "dir:报告").is_empty());
+    }
+
+    #[test]
+    fn path_terms_match_full_path_only_when_they_contain_backslash() {
+        let idx = syntax_index();
+        assert_eq!(search_names(&idx, "工作\\ 报告"), ["报告", "报告.docx"]);
+        assert_eq!(search_names(&idx, "工作\\报告\\"), ["年度.PDF"]);
+        assert_eq!(search_names(&idx, "c:\\song"), ["song.mp3"]);
+        assert_eq!(search_names(&idx, "工作\\ ext:pdf"), ["年度.PDF"]);
+        // 不含 \\ 的词只匹配文件名，不匹配路径
+        assert_eq!(search_names(&idx, "工作"), ["工作"]);
+        // 路径词不产生文件名高亮
+        let r = idx.search("工作\\ 报告.d", Category::All, 5);
+        assert_eq!(r[0].match_ranges, [(0, 8)]);
+    }
+
+    #[test]
+    fn category_counts_ignore_category_filter() {
+        let idx = syntax_index();
+        let q = compile_query("报告");
+        let mut s = spec(&q, 10);
+        s.category = Category::Document;
+        let scan = idx.collect_scored(&s);
+        assert_eq!(scan.total_hits, 2);
+        assert_eq!(scan.category_counts.get(Category::All), 3);
+        assert_eq!(scan.category_counts.get(Category::Folder), 1);
+        assert_eq!(scan.category_counts.get(Category::Document), 2);
+
+        assert_eq!(idx.search("song", Category::Media, 5).len(), 1);
+        assert_eq!(idx.search("song", Category::Other, 5).len(), 0);
+        assert_eq!(idx.search("setup", Category::App, 5).len(), 1);
     }
 
     #[test]

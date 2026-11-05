@@ -11,7 +11,7 @@ mod mft;
 mod persist;
 
 pub use catalog::{Catalog, Scope, ScopeStatus, SearchRequest, SearchResponse};
-pub use category::{classify, Category};
+pub use category::{classify, Category, CategoryCounts};
 pub use drives::ntfs_fixed_drives;
 pub use index::{Change, Index, IndexBuilder, SearchResult, IS_DIR, ROOT_ID};
 pub use mft::{build_index_for_drive, current_usn_state, read_changes};
