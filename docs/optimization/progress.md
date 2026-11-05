@@ -35,3 +35,11 @@
 - 分类归属：`dll` 留在“其他”，因为用户不会直接运行它。
 - 用户可见的过渡问题：前端批次完成前，音视频和程序文件不再出现在旧界面的“其他”标签中，只能在“全部”下看到。
 - 验证：构建和测试通过。合成测试单字符查询中位 9.1 到 12.6 ms，exe 665,600 字节。
+
+### 步骤 6：索引状态与盘管理
+
+- 提交：`24ef0ef`
+- 结果：新增盘状态、进度回调、`drive_statuses`、`list_volumes`、`remove_drive`。原来吞掉的错误现在保存在 `DriveStatus` 中。
+- 与计划的差异：实盘部分只写成示例程序 `examples/volumes.rs`，没有写 `#[ignore]` 测试。否则步骤 3 的 `cargo test --release -p ss-core -- --ignored` 在没有管理员权限时会失败。
+- 验证：构建和测试通过。无管理员权限运行示例：卷列表正确（C、D 盘，NTFS），`Failed` 事件带“拒绝访问”原因。
+- 需要用户手动验证：在管理员终端运行 `target\release\examples\volumes.exe <缓存目录>`，确认能看到 Loading、Building、Ready 事件。
