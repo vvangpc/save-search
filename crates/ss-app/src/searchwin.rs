@@ -10,11 +10,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
-use ss_core::{Catalog, Category, DriveState, Scope, ScopeStatus, SearchResult};
+use ss_core::{Catalog, Category, CategoryCounts, DriveState, Scope, ScopeStatus, SearchResult};
 use ss_ui_model::{
-    all_drives_label, banner, body, ease_toward, enter_op, highlight_segments,
-    is_partial_selection, moved, parent_of, reselect, status_line, Banner, Body, BuildProgress,
-    DriveFailure, ListGeometry, OpenOp, RequestSeq, ScopeProblem, SelMove, ViewInput,
+    all_drives_label, banner, body, compact, ease_toward, enter_op, highlight_segments,
+    is_partial_selection, moved, parent_of, reselect, scope_index, scope_key, status_line, Banner,
+    Body, BuildProgress, DriveFailure, ListGeometry, OpenOp, RequestSeq, ScopeProblem, SelMove,
+    ViewInput,
 };
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -74,14 +75,16 @@ const CB_GETLBTEXT: u32 = 0x0148;
 const CB_GETLBTEXTLEN: u32 = 0x0149;
 const CB_SETITEMHEIGHT: u32 = 0x0153;
 
-// (分类, 标签, Segoe MDL2 Assets glyph)。glyph 已在 Win10/11 目视核验。
-const CATS: [(Category, &str, &str); 6] = [
-    (Category::All, "全部", "\u{E8A9}"),      // GridView
-    (Category::Folder, "文件夹", "\u{E8B7}"), // Folder
-    (Category::Document, "文档", "\u{E8A5}"), // Document
-    (Category::Image, "图片", "\u{EB9F}"),    // Photo（风景）
-    (Category::Archive, "压缩包", "\u{F012}"), // ZipFolder（拉链）
-    (Category::Other, "其他", "\u{E712}"),    // More（•••）
+// (分类, 标签, 保存到设置里的键)。顺序对应 Alt+1…8。
+const CATS: [(Category, &str, &str); 8] = [
+    (Category::All, "全部", ""),
+    (Category::Folder, "文件夹", "folder"),
+    (Category::Document, "文档", "document"),
+    (Category::Image, "图片", "image"),
+    (Category::Media, "音视频", "media"),
+    (Category::Archive, "压缩包", "archive"),
+    (Category::App, "程序", "app"),
+    (Category::Other, "其他", "other"),
 ];
 
 mod st {
@@ -170,6 +173,7 @@ struct Ui {
     foot_wnd: HWND,
     cats: Vec<HWND>,
     row_tags: Vec<RowTag>,
+    counts: CategoryCounts,
     metas: HashMap<String, Rc<RowMeta>>,
     toast: Option<String>,
     seq: RequestSeq,
@@ -449,6 +453,7 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
                 foot_wnd,
                 cats,
                 row_tags: Vec::new(),
+                counts: CategoryCounts::default(),
                 metas: HashMap::new(),
                 toast: None,
                 seq: RequestSeq::default(),
@@ -467,7 +472,10 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
                 results: Rc::new(Vec::new()),
                 drives: Vec::new(),
                 presets: Vec::new(),
-                category: Category::All,
+                category: {
+                    let key = ss_config::load_settings().last_category;
+                    CATS.iter().find(|c| c.2 == key).map_or(Category::All, |c| c.0)
+                },
                 catalog: catalog.clone(),
                 font_ui,
                 font_name,
@@ -610,7 +618,16 @@ pub fn refresh_scopes() {
             None => return,
         }
     };
-    let presets = ss_config::load_settings().preset_folders;
+    let settings = ss_config::load_settings();
+    // 索引第一次就绪时恢复上次的范围，之后（设置变更）保持当前选择
+    let already_ready = UI.with(|c| c.borrow().as_ref().is_some_and(|u| u.index_ready));
+    let wanted = if already_ready {
+        let (drive, folder) = selected_scope(combo);
+        scope_key(drive, folder.as_deref())
+    } else {
+        settings.last_scope
+    };
+    let presets = settings.preset_folders;
     send(combo, CB_RESETCONTENT, 0, 0);
     add_combo(combo, "全部盘");
     let mut maxw = measure_text(font, "全部盘");
@@ -620,13 +637,13 @@ pub fn refresh_scopes() {
         add_combo(combo, &s);
     }
     for f in &presets {
-        let s = format!("📁 {f}");
+        let s = format!("文件夹 {f}");
         maxw = maxw.max(measure_text(font, &s));
         add_combo(combo, &s);
     }
     // 下拉列表宽度按最长项自适应，便于看清完整预设文件夹路径
     send(combo, CB_SETDROPPEDWIDTH, (maxw + sc_dpi(36)) as usize, 0);
-    send(combo, CB_SETCURSEL, 0, 0);
+    send(combo, CB_SETCURSEL, scope_index(&wanted, &letters, &presets), 0);
     UI.with(|c| {
         if let Some(ui) = c.borrow_mut().as_mut() {
             ui.drives = letters;
@@ -763,8 +780,10 @@ fn on_search_done(done: Done) {
                 u.metas.clear();
             }
             u.shown_generation = resp.generation;
+            u.counts = resp.category_counts;
         }
     });
+    invalidate_tabs();
     show_results(done.query, resp.items, Vec::new(), summary, done.keep_position);
 }
 
@@ -886,12 +905,29 @@ fn refresh_view() {
     }
 }
 
+/// 切换分类标签并重新搜索。
+fn set_category(category: Category) {
+    UI.with(|c| {
+        if let Some(ui) = c.borrow_mut().as_mut() {
+            ui.category = category;
+        }
+    });
+    invalidate_tabs();
+    do_search();
+}
+
+fn invalidate_tabs() {
+    if let Some(cats) = UI.with(|c| c.borrow().as_ref().map(|u| u.cats.clone())) {
+        for b in cats {
+            let _ = unsafe { InvalidateRect(Some(b), None, true) };
+        }
+    }
+}
+
 /// 响应横幅或空状态里的操作。
 fn run_act(act: Act) {
-    let Some((combo, cats, failed)) = UI.with(|c| {
-        c.borrow().as_ref().map(|u| {
-            (u.combo, u.cats.clone(), u.failed.iter().map(|f| f.letter).collect::<Vec<char>>())
-        })
+    let Some((combo, failed)) = UI.with(|c| {
+        c.borrow().as_ref().map(|u| (u.combo, u.failed.iter().map(|f| f.letter).collect::<Vec<char>>()))
     }) else {
         return;
     };
@@ -901,17 +937,7 @@ fn run_act(act: Act) {
             update_combo_width();
             do_search();
         }
-        Act::ClearCategory => {
-            UI.with(|c| {
-                if let Some(ui) = c.borrow_mut().as_mut() {
-                    ui.category = Category::All;
-                }
-            });
-            for b in cats {
-                let _ = unsafe { InvalidateRect(Some(b), None, true) };
-            }
-            do_search();
-        }
+        Act::ClearCategory => set_category(Category::All),
         Act::RemovePreset => {
             if let (_, Some(folder)) = selected_scope(combo) {
                 let _ = ss_config::update_settings(|s| s.preset_folders.retain(|f| f != &folder));
@@ -924,15 +950,29 @@ fn run_act(act: Act) {
     }
 }
 
-/// 窗口隐藏时把当前查询词持久化（跨重启记忆）。仅非空才写；`save_last_query` 内部"未变不写盘"。
+/// 窗口隐藏时保存搜索词、范围和分类（跨重启记忆）。搜索词为空时保留原值；内容没有变化时不写盘。
 fn persist_last_query() {
-    if let Some(edit) = UI.with(|c| c.borrow().as_ref().map(|u| u.edit)) {
-        let q = get_text(edit);
-        let q = q.trim();
+    let Some((edit, combo, category, ready)) = UI.with(|c| {
+        c.borrow().as_ref().map(|u| (u.edit, u.combo, u.category, u.index_ready))
+    }) else {
+        return;
+    };
+    let q = get_text(edit);
+    let q = q.trim().to_string();
+    let (drive, folder) = selected_scope(combo);
+    let scope = scope_key(drive, folder.as_deref());
+    let key = CATS.iter().find(|c| c.0 == category).map_or("", |c| c.2);
+    // 写盘失败时进程内的值已更新，下次隐藏会再试，这里不打断用户
+    let _ = ss_config::update_settings(|s| {
         if !q.is_empty() {
-            ss_config::save_last_query(q);
+            s.last_query = q;
         }
-    }
+        // 索引就绪前范围下拉框还是空的，不能覆盖上次的范围
+        if ready {
+            s.last_scope = scope;
+        }
+        s.last_category = key.to_string();
+    });
 }
 
 /// 当前选中的结果：（路径，文件名）。
@@ -1099,11 +1139,20 @@ pub fn pretranslate(msg: &MSG) -> bool {
         }
         return false;
     }
-    if msg.message != WM_KEYDOWN {
+    if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
         return false;
     }
     // 搜索框始终持焦：方向键在此控制列表选中，回车/Esc 全局处理
     if msg.hwnd != edit && msg.hwnd != list {
+        return false;
+    }
+    if msg.message == WM_SYSKEYDOWN {
+        // Alt+1…8 切换分类
+        let digit = (msg.wParam.0 as u32).wrapping_sub(u32::from(b'1')) as usize;
+        if let Some(cat) = CATS.get(digit) {
+            set_category(cat.0);
+            return true;
+        }
         return false;
     }
     let vk = (msg.wParam.0 as u32) as u16;
@@ -1208,31 +1257,34 @@ unsafe fn draw_cat_button(dis: &DRAWITEMSTRUCT) {
     } else {
         t.alt_bg
     };
-    let fg = if active { 0x00FF_FFFF } else { t.fg };
+    let fg = if active { t.accent_fg } else { t.fg };
     let rc = dis.rcItem;
     FillRect(dis.hDC, &rc, theme::solid_brush(bg));
     SetBkMode(dis.hDC, TRANSPARENT);
-    let glyph = CATS.get(idx).map(|c| c.2).unwrap_or("");
-    // 兜底空 HFONT（UI 未初始化时 DC 用默认字体退化绘制），与 :698/:919 站点一致，
-    // 避免 panic=abort 下裸 unwrap 拉死进程
-    let (font_ui, font_icon) = UI
-        .with(|c| c.borrow().as_ref().map(|u| (u.font_ui, u.font_icon)))
-        .unwrap_or((HFONT(std::ptr::null_mut()), HFONT(std::ptr::null_mut())));
+    // 兜底空 HFONT（UI 未初始化时 DC 用默认字体退化绘制），避免 panic=abort 下裸 unwrap 拉死进程
+    let null_font = HFONT(std::ptr::null_mut());
+    let (font_ui, font_small, count) = UI
+        .with(|c| {
+            c.borrow().as_ref().map(|u| {
+                let count = (!u.query_text.is_empty() && u.index_ready).then(|| compact(u.counts.get(cat)));
+                (u.font_ui, u.font_path, count)
+            })
+        })
+        .unwrap_or((null_font, null_font, None));
 
-    // 图标(MDL2) + 文字两段绘制，整体水平居中；窄到放不下时降级为只画图标。
+    // 标签 + 命中数整体居中；放不下时只画标签。
     let gap = sc_dpi(4);
-    let gw = measure_text(font_icon, glyph);
     let lw = measure_text(font_ui, label);
     let avail = rc.right - rc.left;
-    if gw + gap + lw <= avail - sc_dpi(8) {
-        let start = rc.left + (avail - (gw + gap + lw)) / 2;
-        let mut gr = RECT { left: start, top: rc.top, right: start + gw, bottom: rc.bottom };
-        draw_text(dis.hDC, glyph, &mut gr, fg, font_icon, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-        let mut lr = RECT { left: start + gw + gap, top: rc.top, right: rc.right, bottom: rc.bottom };
-        draw_text(dis.hDC, label, &mut lr, fg, font_ui, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-    } else {
-        let mut gr = rc;
-        draw_text(dis.hDC, glyph, &mut gr, fg, font_icon, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    let flags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
+    let count = count.filter(|n| lw + gap + measure_text(font_small, n) <= avail - sc_dpi(6));
+    let cw = count.as_deref().map_or(0, |n| gap + measure_text(font_small, n));
+    let start = rc.left + (avail - lw - cw) / 2;
+    let mut lr = RECT { left: start, top: rc.top, right: rc.right, bottom: rc.bottom };
+    draw_text(dis.hDC, label, &mut lr, fg, font_ui, flags);
+    if let Some(n) = &count {
+        let mut nr = RECT { left: start + lw + gap, top: rc.top, right: rc.right, bottom: rc.bottom };
+        draw_text(dis.hDC, n, &mut nr, if active { fg } else { t.path_fg }, font_small, flags);
     }
 }
 
@@ -1962,18 +2014,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 update_combo_width();
                 do_search();
             } else if id >= CAT_BASE && (id as usize) < CAT_BASE as usize + CATS.len() {
-                let cat = CATS[(id - CAT_BASE) as usize].0;
-                UI.with(|c| {
-                    if let Some(ui) = c.borrow_mut().as_mut() {
-                        ui.category = cat;
-                    }
-                });
-                if let Some(ui_cats) = UI.with(|c| c.borrow().as_ref().map(|u| u.cats.clone())) {
-                    for b in ui_cats {
-                        let _ = InvalidateRect(Some(b), None, true);
-                    }
-                }
-                do_search();
+                set_category(CATS[(id - CAT_BASE) as usize].0);
             }
             LRESULT(0)
         }

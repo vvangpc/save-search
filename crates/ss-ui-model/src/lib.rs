@@ -2,12 +2,14 @@
 
 mod scroll;
 mod selection;
+mod scope;
 mod seq;
 mod status;
 mod text;
 
 pub use scroll::{ease_toward, ListGeometry};
 pub use selection::{moved, reselect, SelMove};
+pub use scope::{scope_index, scope_key};
 pub use seq::RequestSeq;
 pub use text::{
     enter_op, format_date, format_size, highlight_segments, is_partial_selection, parent_of,
