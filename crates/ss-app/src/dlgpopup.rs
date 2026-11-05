@@ -19,7 +19,8 @@ use ss_ui_model::{
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, DrawTextW, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect,
+    BeginPaint, CreateFontW, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
+    InvalidateRect,
     MonitorFromWindow,
     ScreenToClient, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
     DEFAULT_CHARSET, DRAW_TEXT_FORMAT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_PATH_ELLIPSIS,
@@ -661,6 +662,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 set_entries(rest);
                 relayout();
             }
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            // 位置和大小跟随对话框，由 relayout 计算，不用系统建议的矩形
+            let dpi = ((wp.0 & 0xFFFF) as i32).max(96);
+            let font_name = make_font(dpi * 14 / 96, 600, w!("Segoe UI"));
+            let font_path = make_font(dpi * 11 / 96, 400, w!("Segoe UI"));
+            let font_icon = make_font(dpi * 13 / 96, 400, w!("Segoe MDL2 Assets"));
+            let item_h = dpi * 40 / 96;
+            let old = POPUP.with(|c| {
+                c.borrow_mut().as_mut().map(|p| {
+                    let old = [p.font_name, p.font_path, p.font_icon];
+                    p.font_name = font_name;
+                    p.font_path = font_path;
+                    p.font_icon = font_icon;
+                    p.item_h = item_h;
+                    p.dpi = dpi;
+                    old
+                })
+            });
+            for f in old.into_iter().flatten() {
+                let _ = DeleteObject(HGDIOBJ(f.0));
+            }
+            if let Some((_, list)) = popup_handles() {
+                send(list, LB_SETITEMHEIGHT, 0, item_h as isize);
+                let _ = InvalidateRect(Some(list), None, true);
+            }
+            relayout();
             LRESULT(0)
         }
         WM_MEASUREITEM => {

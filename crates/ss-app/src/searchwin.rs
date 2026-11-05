@@ -21,7 +21,8 @@ use ss_ui_model::{
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, DrawTextW, EndPaint, FillRect, FrameRect, GetDC, GetMonitorInfoW,
+    BeginPaint, CreateFontW, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect, GetDC,
+    GetMonitorInfoW,
     GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint, ReleaseDC, SelectObject, SetBkMode,
     SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DRAW_TEXT_FORMAT,
     ClientToScreen, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_PATH_ELLIPSIS, DT_RIGHT,
@@ -29,7 +30,7 @@ use windows::Win32::Graphics::Gdi::{
     HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_C, VK_CONTROL, VK_DOWN,
     VK_END, VK_ESCAPE, VK_HOME, VK_NEXT, VK_PRIOR, VK_RETURN, VK_SHIFT, VK_UP,
@@ -204,6 +205,8 @@ struct Ui {
     item_h: i32,
     dpi: i32,
     combo_w: i32,
+    /// 系统设置允许动画。
+    animate: bool,
     // 平滑滚动状态
     scroll_y: f32,
     target_y: f32,
@@ -485,6 +488,7 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
                 item_h: sc(46),
                 dpi,
                 combo_w: sc(110),
+                animate: animations_enabled(),
                 scroll_y: 0.0,
                 target_y: 0.0,
                 sel: -1,
@@ -551,13 +555,75 @@ unsafe fn layout(hwnd: HWND) {
     let _ = MoveWindow(foot_wnd, 0, h - foot_h, w, foot_h, true);
 }
 
+/// 系统的“显示动画”设置。读取失败时按允许处理。
+fn animations_enabled() -> bool {
+    let mut on = windows::core::BOOL(1);
+    let _ = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(&mut on as *mut _ as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    on.as_bool()
+}
+
+/// 窗口移到 DPI 不同的显示器：重算字体、行高和布局。
+unsafe fn on_dpi_changed(hwnd: HWND, wp: WPARAM, lp: LPARAM) {
+    let dpi = ((wp.0 & 0xFFFF) as i32).max(96);
+    let sc = |v: i32| v * dpi / 96;
+    let font_ui = make_font(sc(15), 400, w!("Segoe UI"));
+    let font_name = make_font(sc(15), 600, w!("Segoe UI"));
+    let font_path = make_font(sc(12), 400, w!("Segoe UI"));
+    let font_icon = make_font(sc(15), 400, w!("Segoe MDL2 Assets"));
+    let Some((old, edit, combo, cats)) = UI.with(|c| {
+        c.borrow_mut().as_mut().map(|u| {
+            let old = [u.font_ui, u.font_name, u.font_path, u.font_icon];
+            let old_dpi = u.dpi.max(1);
+            u.font_ui = font_ui;
+            u.font_name = font_name;
+            u.font_path = font_path;
+            u.font_icon = font_icon;
+            u.item_h = sc(46);
+            u.extra_h = u.extra_h * dpi / old_dpi;
+            u.combo_w = u.combo_w * dpi / old_dpi;
+            u.scroll_y = u.scroll_y * dpi as f32 / old_dpi as f32;
+            u.target_y = u.scroll_y;
+            u.dpi = dpi;
+            (old, u.edit, u.combo, u.cats.clone())
+        })
+    }) else {
+        return;
+    };
+    set_font(edit, font_ui);
+    set_font(combo, font_ui);
+    send(combo, CB_SETITEMHEIGHT, 0, sc(22) as isize);
+    send(combo, CB_SETITEMHEIGHT, -1isize as usize, sc(22) as isize);
+    for b in &cats {
+        set_font(*b, font_ui);
+    }
+    for f in old {
+        let _ = DeleteObject(HGDIOBJ(f.0));
+    }
+    // 建议的矩形由系统给出，移动后会触发 WM_SIZE 重新布局
+    let r = &*(lp.0 as *const RECT);
+    let _ = MoveWindow(hwnd, r.left, r.top, r.right - r.left, r.bottom - r.top, true);
+    update_combo_width();
+    let _ = InvalidateRect(Some(hwnd), None, true);
+}
+
 /// 在鼠标所在显示器的工作区居中偏上（原先固定按主屏尺寸算，多显示器时总弹在主屏）。
 unsafe fn center(hwnd: HWND) {
-    let w = sc_dpi(820);
-    let h = sc_dpi(560);
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    // 按目标显示器的 DPI 计算大小，窗口可能还在另一块显示器上
+    let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
+    let _ = GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+    let dpi = (dpi_x as i32).max(96);
+    let w = 820 * dpi / 96;
+    let h = 560 * dpi / 96;
     let mut mi = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
@@ -573,6 +639,8 @@ unsafe fn center(hwnd: HWND) {
         let sh = GetSystemMetrics(SM_CYSCREEN);
         ((sw - w) / 2, (sh - h) / 3)
     };
+    let _ = MoveWindow(hwnd, x, y, w, h, true);
+    // 跨显示器时第一次移动触发 WM_DPICHANGED，系统建议的矩形可能和这里不同，再定位一次
     let _ = MoveWindow(hwnd, x, y, w, h, true);
 }
 
@@ -1107,6 +1175,11 @@ pub fn toggle() {
             hide_window(search, list);
         } else {
             center(search);
+            UI.with(|c| {
+                if let Some(u) = c.borrow_mut().as_mut() {
+                    u.animate = animations_enabled();
+                }
+            });
             let _ = ShowWindow(search, SW_SHOW);
             let _ = SetForegroundWindow(search);
             let _ = SetFocus(Some(edit));
@@ -1342,12 +1415,23 @@ fn set_target(list: HWND, y: f32) {
         });
         return;
     }
-    UI.with(|c| {
-        if let Some(u) = c.borrow_mut().as_mut() {
+    let animate = UI.with(|c| {
+        c.borrow_mut().as_mut().is_some_and(|u| {
             u.target_y = y.clamp(0.0, max_scroll);
-        }
+            if !u.animate {
+                u.scroll_y = u.target_y;
+            }
+            u.animate
+        })
     });
-    start_anim(list);
+    if animate {
+        start_anim(list);
+    } else {
+        unsafe {
+            update_scrollbar(list);
+            let _ = InvalidateRect(Some(list), None, false);
+        }
+    }
 }
 
 fn stop_anim(list: HWND) {
@@ -2013,6 +2097,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_SIZE => {
             layout(hwnd);
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            on_dpi_changed(hwnd, wp, lp);
             LRESULT(0)
         }
         WM_CLOSE => {
