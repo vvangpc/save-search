@@ -63,6 +63,17 @@ pub struct SearchRequest<'a> {
     pub limit: usize,
     /// 置为 true 后，扫描线程会尽快停止。
     pub cancel: Option<&'a AtomicBool>,
+    /// 不搜索这些目录的子树（完整路径）。不存在的路径会被忽略。
+    pub exclude_dirs: &'a [String],
+    /// 不要带隐藏或系统属性的节点，也不要这类目录下的节点。
+    pub hide_system: bool,
+}
+
+/// 排除目录的解析结果。`find_dir_by_path` 是线性扫描，不缓存则每次击键都要重跑。
+struct ExcludeCache {
+    generation: u64,
+    /// 每个路径解析到的（盘下标，目录节点 id）。
+    entries: Vec<(String, Option<(usize, u32)>)>,
 }
 
 /// 一次搜索的结果。
@@ -92,6 +103,7 @@ pub struct Catalog {
     generation: u64,
     /// 按盘符排序的状态，包含加载失败、没有索引的盘。
     statuses: Vec<DriveStatus>,
+    exclude_cache: Mutex<Option<ExcludeCache>>,
 }
 
 fn cache_path(dir: &Path, letter: char) -> PathBuf {
@@ -113,6 +125,7 @@ impl Catalog {
             statuses,
             folder_cache: Mutex::new(None),
             generation: 0,
+            exclude_cache: Mutex::new(None),
         }
     }
 
@@ -434,6 +447,48 @@ impl Catalog {
         }
     }
 
+    /// 把一个路径解析成（盘下标，目录节点 id）。
+    fn resolve_dir(&self, path: &str) -> Option<(usize, u32)> {
+        let di = path.chars().next().and_then(|c| self.drive_position(c))?;
+        let id = self.indexes[di].find_dir_by_path(path)?;
+        Some((di, id))
+    }
+
+    /// 返回每个盘要排除的目录节点 id。结果带缓存：路径列表和 generation 都没变时直接复用；
+    /// 只有 generation 变了时，已解析的条目用 `is_live_dir_at` 校验，其余的才重新解析。
+    fn resolve_excludes(&self, dirs: &[String]) -> Vec<Vec<u32>> {
+        let mut per_drive = vec![Vec::new(); self.indexes.len()];
+        if dirs.is_empty() {
+            return per_drive;
+        }
+        let mut cache = self.exclude_cache.lock().unwrap_or_else(|p| p.into_inner());
+        let same_dirs = cache.as_ref().is_some_and(|c| {
+            c.entries.len() == dirs.len() && c.entries.iter().zip(dirs).all(|(e, d)| &e.0 == d)
+        });
+        if !same_dirs {
+            *cache = Some(ExcludeCache {
+                generation: self.generation,
+                entries: dirs.iter().map(|d| (d.clone(), self.resolve_dir(d))).collect(),
+            });
+        } else if let Some(c) = cache.as_mut().filter(|c| c.generation != self.generation) {
+            c.generation = self.generation;
+            for (path, resolved) in &mut c.entries {
+                let still_valid = resolved.is_some_and(|(di, id)| {
+                    self.indexes.get(di).is_some_and(|idx| idx.is_live_dir_at(id, path))
+                });
+                if !still_valid {
+                    *resolved = self.resolve_dir(path);
+                }
+            }
+        }
+        if let Some(c) = cache.as_ref() {
+            for (di, id) in c.entries.iter().filter_map(|(_, r)| *r) {
+                per_drive[di].push(id);
+            }
+        }
+        per_drive
+    }
+
     fn drive_position(&self, letter: char) -> Option<usize> {
         let letter = letter.to_ascii_uppercase();
         self.indexes.iter().position(|i| i.drive_letter() == letter)
@@ -444,6 +499,7 @@ impl Catalog {
         let started = Instant::now();
         let compiled = compile_query(req.query);
         let (scope_status, targets) = self.resolve_scope(&req.scope);
+        let excluded = self.resolve_excludes(req.exclude_dirs);
 
         let mut merged: Vec<(ScoreKey, usize, u32)> = Vec::new();
         let mut total_hits = 0usize;
@@ -456,6 +512,8 @@ impl Catalog {
                 ancestor,
                 limit: req.limit,
                 cancel: req.cancel,
+                excluded: &excluded[di],
+                hide_system: req.hide_system,
             });
             total_hits += scan.total_hits;
             category_counts.merge(&scan.category_counts);
@@ -505,6 +563,8 @@ impl Catalog {
             category,
             limit,
             cancel: None,
+            exclude_dirs: &[],
+            hide_system: false,
         })
         .items
     }
@@ -534,6 +594,8 @@ mod tests {
             category: Category::All,
             limit: 10,
             cancel: None,
+            exclude_dirs: &[],
+            hide_system: false,
         }
     }
 
@@ -581,6 +643,60 @@ mod tests {
         assert_eq!(drive.scope_status, ScopeStatus::DriveNotIndexed);
         let folder = cat.query(&req("report", Scope::Folder("E:\\x".into())));
         assert_eq!(folder.scope_status, ScopeStatus::DriveNotIndexed);
+    }
+
+    #[test]
+    fn exclude_dirs_hide_subtree_and_survive_index_changes() {
+        let mut c = IndexBuilder::new(b'C');
+        c.push(100, 5, DIR, "node_modules");
+        c.push(101, 100, DIR, "pkg");
+        c.push(200, 101, 0, "index_deep.js");
+        c.push(201, 5, 0, "index_top.js");
+        let mut cat = Catalog::from_indexes(vec![c.finish()]);
+
+        let dirs = vec!["c:\\NODE_MODULES\\".to_string(), "C:\\later".to_string(), "Z:\\x".to_string()];
+        let mut r = req("index", Scope::All);
+        r.exclude_dirs = &dirs;
+        let resp = cat.query(&r);
+        assert_eq!(resp.total_hits, 1);
+        assert_eq!(resp.items[0].name, "index_top.js");
+
+        // 排除目录中还不存在的路径，出现后 generation 变化，会重新解析
+        cat.apply_drive_changes('C', &[
+            Change::Upsert { frn: 300, parent_frn: 5, attrs: DIR, name: "later".into() },
+            Change::Upsert { frn: 301, parent_frn: 300, attrs: 0, name: "index_later.js".into() },
+        ], 1);
+        let resp = cat.query(&SearchRequest { exclude_dirs: &dirs, ..req("index", Scope::All) });
+        assert_eq!(resp.total_hits, 1);
+
+        // 已解析的目录被删除后重建：旧 id 校验失败，解析到新节点
+        cat.apply_drive_changes('C', &[
+            Change::Delete { frn: 200 },
+            Change::Delete { frn: 101 },
+            Change::Delete { frn: 100 },
+            Change::Upsert { frn: 400, parent_frn: 5, attrs: DIR, name: "node_modules".into() },
+            Change::Upsert { frn: 401, parent_frn: 400, attrs: 0, name: "index_new.js".into() },
+        ], 2);
+        let resp = cat.query(&SearchRequest { exclude_dirs: &dirs, ..req("index", Scope::All) });
+        assert_eq!(resp.total_hits, 1);
+        assert_eq!(resp.items[0].name, "index_top.js");
+
+        // 不排除时全部可见
+        assert_eq!(cat.query(&req("index", Scope::All)).total_hits, 3);
+    }
+
+    #[test]
+    fn query_applies_hide_system() {
+        let mut c = IndexBuilder::new(b'C');
+        c.push(100, 5, 0x02, "x_hidden.txt");
+        c.push(101, 5, 0, "x_normal.txt");
+        let cat = Catalog::from_indexes(vec![c.finish()]);
+        assert_eq!(cat.query(&req("x_", Scope::All)).total_hits, 2);
+        let resp = cat.query(&SearchRequest { hide_system: true, ..req("x_", Scope::All) });
+        assert_eq!(resp.total_hits, 1);
+        assert_eq!(resp.items[0].name, "x_normal.txt");
+        // 旧接口不过滤
+        assert_eq!(cat.search("x_", None, None, Category::All, 10).len(), 2);
     }
 
     #[test]

@@ -18,6 +18,10 @@ use crate::category::{classify, ext_of, Category, CategoryCounts};
 pub const IS_DIR: u16 = 1 << 0;
 /// 已删除（USN 删除事件后置位，搜索时跳过；全量重建时清理）。
 pub const IS_DELETED: u16 = 1 << 1;
+/// 带隐藏属性（来自 MFT/USN 的 FILE_ATTRIBUTE_HIDDEN）。
+pub const IS_HIDDEN: u16 = 1 << 2;
+/// 带系统属性（来自 MFT/USN 的 FILE_ATTRIBUTE_SYSTEM）。
+pub const IS_SYSTEM: u16 = 1 << 3;
 
 /// 合成根节点 id（代表盘符根，如 `C:\`）。
 pub const ROOT_ID: u32 = 0;
@@ -32,7 +36,25 @@ pub(crate) const NO_ID: u32 = u32::MAX;
 /// 损坏数据触发天量分配；超限的节点直接忽略。
 pub(crate) const MAX_RECORDS: usize = 1 << 28;
 
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x02;
+const FILE_ATTRIBUTE_SYSTEM: u32 = 0x04;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
+/// 由文件属性得到节点标志位。
+#[inline]
+fn flags_from_attrs(attrs: u32) -> u16 {
+    let mut f = 0u16;
+    if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        f |= IS_DIR;
+    }
+    if attrs & FILE_ATTRIBUTE_HIDDEN != 0 {
+        f |= IS_HIDDEN;
+    }
+    if attrs & FILE_ATTRIBUTE_SYSTEM != 0 {
+        f |= IS_SYSTEM;
+    }
+    f
+}
 
 #[inline]
 fn frn_rec(frn: u64) -> usize {
@@ -371,6 +393,10 @@ pub(crate) struct ScanSpec<'a> {
     pub ancestor: Option<u32>,
     pub limit: usize,
     pub cancel: Option<&'a AtomicBool>,
+    /// 这些目录的子树不参与搜索（节点 id）。
+    pub excluded: &'a [u32],
+    /// 不要带隐藏或系统属性的节点，也不要这类目录下的节点。
+    pub hide_system: bool,
 }
 
 /// 每扫描这么多节点检查一次取消标记。
@@ -472,11 +498,7 @@ impl IndexBuilder {
         self.name_pool.extend_from_slice(bytes);
         self.names_off.push(off);
         self.names_len.push(bytes.len().min(u16::MAX as usize) as u16);
-        let mut f = 0u16;
-        if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
-            f |= IS_DIR;
-        }
-        self.flags.push(f);
+        self.flags.push(flags_from_attrs(attrs));
         self.seq.push(frn_seq(frn));
         self.parent_frn.push(parent_frn);
         if rec >= self.rec_to_id.len() {
@@ -717,6 +739,8 @@ impl Index {
             ancestor,
             limit,
             cancel,
+            excluded,
+            hide_system,
         } = *spec;
         let mut heap: BinaryHeap<(ScoreKey, u32)> = BinaryHeap::new();
         let mut total_hits = 0usize;
@@ -754,6 +778,9 @@ impl Index {
                 if !self.is_descendant(id, anc) {
                     continue;
                 }
+            }
+            if (hide_system || !excluded.is_empty()) && self.is_hidden_by(id, excluded, hide_system) {
+                continue;
             }
             if !query.path_terms.is_empty() {
                 self.write_path(id, &mut path_buf);
@@ -877,6 +904,8 @@ impl Index {
             ancestor,
             limit,
             cancel: None,
+            excluded: &[],
+            hide_system: false,
         });
         scan.hits
             .into_iter()
@@ -898,6 +927,22 @@ impl Index {
 
     pub fn search(&self, query: &str, category: Category, limit: usize) -> Vec<SearchResult> {
         self.search_scored(query, category, None, limit)
+    }
+
+    /// 沿父链检查节点（含自身）是否在排除目录内，或（`hide_system` 时）带隐藏/系统属性。
+    fn is_hidden_by(&self, node: u32, excluded: &[u32], hide_system: bool) -> bool {
+        let mut cur = node;
+        let mut guard = 0;
+        while cur != u32::MAX && guard < 4096 {
+            if excluded.contains(&cur)
+                || (hide_system && self.flags[cur as usize] & (IS_HIDDEN | IS_SYSTEM) != 0)
+            {
+                return true;
+            }
+            cur = self.parent[cur as usize];
+            guard += 1;
+        }
+        false
     }
 
     /// 节点是否为 `ancestor` 的后代（含自身）。
@@ -993,7 +1038,7 @@ impl Index {
         *f |= IS_DELETED;
     }
 
-    fn push_node(&mut self, name: &str, parent_id: u32, is_dir: bool, seq: u16) -> u32 {
+    fn push_node(&mut self, name: &str, parent_id: u32, flags: u16, seq: u16) -> u32 {
         let id = self.names_len.len() as u32;
         let bytes = name.as_bytes();
         grow_exact(&mut self.names_off, 1, NODE_GROW_MIN);
@@ -1007,7 +1052,7 @@ impl Index {
         self.names_off.push(off);
         self.names_len.push(bytes.len().min(u16::MAX as usize) as u16);
         self.parent.push(parent_id);
-        self.flags.push(if is_dir { IS_DIR } else { 0 });
+        self.flags.push(flags);
         self.seq.push(seq);
         id
     }
@@ -1042,11 +1087,10 @@ impl Index {
                 }
                 let seq = frn_seq(*frn);
                 let parent_id = self.resolve_parent(*parent_frn);
-                let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+                let flags = flags_from_attrs(*attrs);
                 let existing = self.rec_to_id.get(rec).copied().filter(|&id| id != NO_ID);
                 match existing {
                     Some(id) if self.seq[id as usize] == seq => {
-                        let flags = if is_dir { IS_DIR } else { 0 };
                         let i = id as usize;
                         if self.name_bytes(id) == name.as_bytes()
                             && self.parent[i] == parent_id
@@ -1065,7 +1109,7 @@ impl Index {
                         if let Some(old) = other {
                             self.tombstone(old);
                         }
-                        let id = self.push_node(name, parent_id, is_dir, seq);
+                        let id = self.push_node(name, parent_id, flags, seq);
                         if rec >= self.rec_to_id.len() {
                             let need = rec + 1 - self.rec_to_id.len();
                             grow_exact(&mut self.rec_to_id, need, NODE_GROW_MIN);
@@ -1398,7 +1442,51 @@ mod tests {
             ancestor: None,
             limit,
             cancel: None,
+            excluded: &[],
+            hide_system: false,
         }
+    }
+
+    #[test]
+    fn attributes_are_kept_by_push_and_apply() {
+        const HIDDEN: u32 = FILE_ATTRIBUTE_HIDDEN;
+        const SYSTEM: u32 = FILE_ATTRIBUTE_SYSTEM;
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, HIDDEN, "h.txt");
+        b.push(101, 5, SYSTEM | FILE_ATTRIBUTE_DIRECTORY, "s");
+        b.push(102, 5, 0, "n.txt");
+        let mut idx = b.finish();
+        assert_eq!(idx.flags[1], IS_HIDDEN);
+        assert_eq!(idx.flags[2], IS_SYSTEM | IS_DIR);
+        assert_eq!(idx.flags[3], 0);
+
+        // apply 不能丢掉属性，属性变化也算索引变化
+        assert!(idx.apply(&Change::Upsert { frn: 102, parent_frn: 5, attrs: HIDDEN, name: "n.txt".into() }));
+        assert_eq!(idx.flags[3], IS_HIDDEN);
+        assert!(!idx.apply(&Change::Upsert { frn: 102, parent_frn: 5, attrs: HIDDEN, name: "n.txt".into() }));
+        assert!(idx.apply(&Change::Upsert { frn: 102, parent_frn: 5, attrs: 0, name: "n.txt".into() }));
+        assert_eq!(idx.flags[3], 0);
+        // 新增节点也带属性
+        idx.apply(&Change::Upsert { frn: 103, parent_frn: 5, attrs: SYSTEM, name: "new.sys".into() });
+        assert_eq!(idx.flags[4], IS_SYSTEM);
+    }
+
+    #[test]
+    fn hide_system_also_hides_descendants() {
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN, "AppData");
+        b.push(200, 100, 0, "a_inside.txt");
+        b.push(201, 5, FILE_ATTRIBUTE_SYSTEM, "a_system.txt");
+        b.push(202, 5, 0, "a_normal.txt");
+        let idx = b.finish();
+        let q = compile_query("a_");
+        let mut s = spec(&q, 10);
+        assert_eq!(idx.collect_scored(&s).total_hits, 3);
+        s.hide_system = true;
+        let scan = idx.collect_scored(&s);
+        assert_eq!(scan.total_hits, 1);
+        assert_eq!(scan.category_counts.get(Category::All), 1);
+        assert_eq!(idx.name(scan.hits[0].1), "a_normal.txt");
     }
 
     #[test]

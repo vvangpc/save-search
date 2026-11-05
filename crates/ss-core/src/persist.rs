@@ -1,7 +1,9 @@
 //! 索引磁盘缓存（自定义二进制：长度前缀 + 原始字节块，快速读写）。
 //!
 //! v3（SSIDX03）：落盘 `seq`（每节点 FRN 序列号）与 `rec_to_id`（MFT 记录号→id 稠密表），
-//! 取代 v2 的 frns/ids 并行数组 + 加载时重建 HashMap。旧版缓存 magic 不符 → 全量重建一次。
+//! 取代 v2 的 frns/ids 并行数组 + 加载时重建 HashMap。
+//! v4（SSIDX04）：结构不变，`flags` 增加隐藏和系统属性。旧版缓存没有这两位，
+//! magic 不符会被拒绝，随后全量重建一次。
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -9,7 +11,7 @@ use std::path::Path;
 
 use crate::index::{Index, MAX_RECORDS, NO_ID};
 
-const MAGIC: &[u8; 8] = b"SSIDX03\0";
+const MAGIC: &[u8; 8] = b"SSIDX04\0";
 
 fn write_vec<T: Copy>(w: &mut impl Write, v: &[T]) -> io::Result<()> {
     w.write_all(&(v.len() as u64).to_le_bytes())?;
@@ -160,7 +162,7 @@ pub fn load_index(path: &Path) -> io::Result<Index> {
 #[cfg(test)]
 mod tests {
     use crate::category::Category;
-    use crate::index::{Change, IndexBuilder};
+    use crate::index::{Change, IndexBuilder, IS_DIR, IS_HIDDEN, IS_SYSTEM};
 
     #[test]
     fn roundtrip_recomputes_tombstones() {
@@ -186,6 +188,41 @@ mod tests {
         assert_eq!(loaded.len(), idx.len());
         assert_eq!(loaded.search("c.txt", Category::All, 10).len(), 1);
         assert_eq!(loaded.search("b.txt", Category::All, 10).len(), 0);
+    }
+
+    #[test]
+    fn attributes_survive_roundtrip() {
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, 0x02, "hidden.txt");
+        b.push(200, 5, 0x04 | 0x10, "system_dir");
+        let idx = b.finish();
+        let path = std::env::temp_dir().join(format!(
+            "ss-core-persist-attrs-{}.ssidx",
+            std::process::id()
+        ));
+        super::save_index(&idx, &path).unwrap();
+        let loaded = super::load_index(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.flags[1], IS_HIDDEN);
+        assert_eq!(loaded.flags[2], IS_SYSTEM | IS_DIR);
+    }
+
+    #[test]
+    fn v3_cache_is_rejected_to_force_rebuild() {
+        // 结构与 v4 相同的完整文件，只有 magic 是 v3
+        let idx = IndexBuilder::new(b'C').finish();
+        let path = std::env::temp_dir().join(format!(
+            "ss-core-persist-v3-{}.ssidx",
+            std::process::id()
+        ));
+        super::save_index(&idx, &path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(super::load_index(&path).is_ok());
+        bytes[..8].copy_from_slice(b"SSIDX03\0");
+        std::fs::write(&path, &bytes).unwrap();
+        let err = super::load_index(&path).err().expect("v3 缓存必须被拒绝");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
