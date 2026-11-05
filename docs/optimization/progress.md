@@ -60,3 +60,12 @@
 - 决定：`hide_system` 同时隐藏带隐藏/系统属性的目录下的内容（如 `$Recycle.Bin`、`AppData`），否则回收站里的文件仍会出现。默认值 `false`，行为与现在一致。
 - 已知限制：USN 读取掩码不含属性变更事件（`BASIC_INFO_CHANGE` 频率很高，写入时间戳变化也会触发）。单独修改隐藏属性要等文件改名或索引重建后才生效。
 - 验证：构建和测试通过。合成测试单字符查询中位 9.0 到 12.0 ms，索引内存 80.1 MB（与基线相同），exe 684,032 字节。
+
+### 步骤 9：结果操作接口
+
+- 提交：`f14477b`
+- 结果：新增 `actions.rs` 和 `examples/actions.rs`。依赖没有变化，只给 `windows` 增加了 DataExchange、Memory 两个 feature。
+- 计划外补充：`copy_text`（前端的 Ctrl+Shift+C 复制文件名要用）。`copy_path` 需要传入窗口，因为不指定剪贴板所有者时 `SetClipboardData` 可能失败。
+- 已知限制：右键菜单中只有 `open`、`edit`、`print` 转交 Explorer。其他菜单项（如第三方的“用 XX 打开”）在本进程内执行，它们启动的程序会继承管理员权限。
+- 验证：构建和测试通过。首次运行示例时发现 `GetItemObject` 不接受直接请求 `IShellFolderViewDual`，已改为先取 `IDispatch`，修复后用测试脚本确认能启动且工作目录正确。这次运行没有管理员权限，所以还不能证明降权有效。
+- 需要用户手动验证：在管理员终端运行 `target\release\examples\actions.exe open C:\Windows\System32\notepad.exe`，确认任务管理器“提升的”一列为“否”。另外用 `reveal`、`copy`、`props`、`menu` 各试一次，其中 `menu` 要确认“打开方式”“发送到”子菜单能展开。

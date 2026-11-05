@@ -11,5 +11,5 @@ pub use actions::{
     copy_path, copy_text, open_deelevated, reveal, show_context_menu, show_properties, ActionError,
     MenuOutcome,
 };
-pub use dialog::{is_file_dialog, navigate_dialog};
-pub use explorer::enumerate_open_folders;
+pub use dialog::{is_file_dialog, navigate_dialog, navigate_dialog_checked, NavError};
+pub use explorer::{enumerate_open_folders, enumerate_open_folders_by_z_order, OpenFolder};

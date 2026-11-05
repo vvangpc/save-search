@@ -14,6 +14,10 @@ fn main() {
         folders.join("\n")
     );
     print!("{out}");
+    println!("按 Z 序（最上层在前）：");
+    for f in ss_shell::enumerate_open_folders_by_z_order() {
+        println!("{:#x} {}", f.hwnd, f.path);
+    }
     if let Some(p) = std::env::args().nth(1) {
         let _ = std::fs::write(p, out);
     }
