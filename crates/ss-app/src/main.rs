@@ -171,7 +171,7 @@ unsafe fn add_tray(hwnd: HWND) {
     if let Some(icon) = load_app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) {
         nid.hIcon = icon;
     }
-    fill_u16(&mut nid.szTip, "SaveSearch — 文件搜索 / 保存位置快选");
+    fill_u16(&mut nid.szTip, "SaveSearch");
     let _ = Shell_NotifyIconW(NIM_ADD, &nid);
 }
 
