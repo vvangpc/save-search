@@ -5,6 +5,7 @@ mod selection;
 mod popup;
 mod scope;
 mod seq;
+mod settings;
 mod status;
 mod text;
 
@@ -15,6 +16,7 @@ pub use popup::{
 };
 pub use scope::{scope_index, scope_key};
 pub use seq::RequestSeq;
+pub use settings::{index_stats, parse_hotkey, parse_recent_max, parse_result_limit, Hotkey};
 pub use text::{
     enter_op, format_date, format_size, highlight_segments, is_partial_selection, parent_of,
     LocalTime, OpenOp,

@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering}
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM,
@@ -30,7 +30,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, MOD_ALT, MOD_NOREPEAT, VK_SPACE,
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
 };
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -62,6 +62,42 @@ static SEARCH_HWND: AtomicIsize = AtomicIsize::new(0);
 /// 上次成功读取文件变更的时间（Unix 秒），0 表示还没有。
 static LAST_SYNC: AtomicU64 = AtomicU64::new(0);
 static REBUILDING: AtomicBool = AtomicBool::new(false);
+/// 当前注册成功的全局热键。
+static CURRENT_HOTKEY: Mutex<Option<ss_ui_model::Hotkey>> = Mutex::new(None);
+const HOTKEY_ID: i32 = 1;
+
+unsafe fn register_hotkey(h: ss_ui_model::Hotkey) -> bool {
+    // MOD_NOREPEAT：长按不重复触发
+    let mods = HOT_KEY_MODIFIERS(h.modifiers) | MOD_NOREPEAT;
+    RegisterHotKey(None, HOTKEY_ID, mods, h.key).is_ok()
+}
+
+/// 启动时的热键没有注册成功（被其他程序占用）。
+pub(crate) fn hotkey_failed() -> bool {
+    CURRENT_HOTKEY.lock().is_none()
+}
+
+/// 改用新的全局热键。新组合被占用时恢复旧的，并返回 false。必须在主线程调用。
+pub(crate) fn apply_hotkey(new: ss_ui_model::Hotkey) -> bool {
+    let mut current = CURRENT_HOTKEY.lock();
+    if *current == Some(new) {
+        return true;
+    }
+    unsafe {
+        if current.is_some() {
+            let _ = UnregisterHotKey(None, HOTKEY_ID);
+        }
+        if register_hotkey(new) {
+            *current = Some(new);
+            true
+        } else {
+            if let Some(old) = *current {
+                register_hotkey(old);
+            }
+            false
+        }
+    }
+}
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -418,8 +454,12 @@ fn main() -> windows::core::Result<()> {
             });
         }
 
-        // 注册全局热键 Alt+Space（MOD_NOREPEAT：长按不重复触发 toggle）
-        let _ = RegisterHotKey(None, 1, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32);
+        // 注册全局热键。配置文件里的值无法解析时用默认值。
+        let hotkey = ss_ui_model::parse_hotkey(&settings.hotkey)
+            .or_else(|| ss_ui_model::parse_hotkey("Alt+Space"));
+        if let Some(h) = hotkey {
+            apply_hotkey(h);
+        }
 
         // 功能2：保存/打开对话框浮窗 + WinEvent 钩子（监听对话框出现/移动/关闭）。
         // 钩子范围收窄成两段：0x8001(DESTROY)-0x8003(HIDE) 含 SHOW=0x8002，

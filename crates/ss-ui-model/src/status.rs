@@ -175,7 +175,7 @@ pub fn all_drives_label(letters: &[char]) -> String {
     format!("{} 盘", names.join("、"))
 }
 
-fn synced_text(secs: u64) -> String {
+pub(crate) fn synced_text(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs} 秒前更新"),
         60..=3599 => format!("{} 分钟前更新", secs / 60),
