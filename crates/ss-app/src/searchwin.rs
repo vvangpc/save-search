@@ -9,10 +9,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
-use ss_core::{Catalog, Category, DriveState, Scope, ScopeStatus, SearchRequest, SearchResult};
+use ss_core::{Catalog, Category, DriveState, Scope, ScopeStatus, SearchResult};
 use ss_ui_model::{
-    all_drives_label, banner, body, ease_toward, moved, status_line, Banner, Body, BuildProgress,
-    DriveFailure, ListGeometry, ScopeProblem, SelMove, ViewInput,
+    all_drives_label, banner, body, ease_toward, moved, reselect, status_line, Banner, Body,
+    BuildProgress, DriveFailure, ListGeometry, RequestSeq, ScopeProblem, SelMove, ViewInput,
 };
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -36,6 +36,7 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::search_worker::{self, Done, Job};
 use crate::{icons, paint, theme};
 use crate::theme::Theme;
 
@@ -43,6 +44,10 @@ pub type SharedCatalog = Arc<RwLock<Option<Catalog>>>;
 
 pub const WM_APP_INDEX_READY: u32 = WM_APP + 2;
 pub const WM_APP_INDEX_PROGRESS: u32 = WM_APP + 3;
+pub const WM_APP_SEARCH_DONE: u32 = WM_APP + 4;
+/// USN 线程每轮轮询后发送：刷新状态栏，索引有变化时重新搜索。
+pub const WM_APP_INDEX_TICK: u32 = WM_APP + 5;
+pub const WM_APP_ICONS_READY: u32 = WM_APP + 6;
 
 const EDIT_ID: u32 = 101;
 const COMBO_ID: u32 = 103;
@@ -157,6 +162,9 @@ struct Ui {
     foot_wnd: HWND,
     cats: Vec<HWND>,
     row_tags: Vec<RowTag>,
+    seq: RequestSeq,
+    /// 当前结果对应的索引版本。
+    shown_generation: u64,
     extra_h: i32,
     query_text: String,
     summary: Summary,
@@ -431,6 +439,8 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
                 foot_wnd,
                 cats,
                 row_tags: Vec::new(),
+                seq: RequestSeq::default(),
+                shown_generation: 0,
                 extra_h: 0,
                 query_text: String::new(),
                 summary: Summary::default(),
@@ -446,7 +456,7 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
                 drives: Vec::new(),
                 presets: Vec::new(),
                 category: Category::All,
-                catalog,
+                catalog: catalog.clone(),
                 font_ui,
                 font_name,
                 font_path,
@@ -463,6 +473,7 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
         });
 
         theme::apply_window(hwnd);
+        search_worker::start(catalog, hwnd.0 as isize);
         layout(hwnd);
         // 跨重启记忆：预填上次搜索词（显示时由 toggle 全选，用户打字即整体覆盖）
         let last = ss_config::last_query();
@@ -682,40 +693,48 @@ fn to_scope(drive: Option<char>, folder: Option<String>) -> Scope {
     }
 }
 
+/// 用户改变了搜索条件：选中第一条。
 fn do_search() {
-    let (edit, combo, category, cat_arc) = match UI.with(|c| {
-        c.borrow()
-            .as_ref()
-            .map(|u| (u.edit, u.combo, u.category, u.catalog.clone()))
-    }) {
-        Some(t) => t,
-        None => return,
+    start_search(false);
+}
+
+/// 发起搜索。新结果到达前保留旧列表；空输入和索引未就绪时不需要工作线程。
+fn start_search(keep_position: bool) {
+    let Some((edit, combo, category, ready)) = UI.with(|c| {
+        c.borrow().as_ref().map(|u| (u.edit, u.combo, u.category, u.index_ready))
+    }) else {
+        return;
     };
     let query = get_text(edit);
     let q = query.trim().to_string();
-    if q.is_empty() {
-        let (rows, tags) = home_rows();
-        show_results(q, rows, tags, Summary::default());
+    let seq = UI.with(|c| c.borrow_mut().as_mut().map(|u| u.seq.next())).unwrap_or(0);
+    if q.is_empty() || !ready {
+        search_worker::submit(None);
+        let (rows, tags) = if q.is_empty() { home_rows() } else { (Vec::new(), Vec::new()) };
+        show_results(q, rows, tags, Summary::default(), false);
         return;
     }
     let (drive, folder) = selected_scope(combo);
     let settings = ss_config::load_settings();
-    let guard = cat_arc.read();
-    let Some(cat) = guard.as_ref() else {
-        drop(guard);
-        show_results(q, Vec::new(), Vec::new(), Summary::default());
-        return;
-    };
-    let resp = cat.query(&SearchRequest {
-        query: &q,
+    search_worker::submit(Some(Job {
+        seq,
+        query: q,
         scope: to_scope(drive, folder),
         category,
         limit: settings.result_limit,
-        cancel: None,
-        exclude_dirs: &settings.exclude_dirs,
+        exclude_dirs: settings.exclude_dirs,
         hide_system: settings.hide_system,
-    });
-    drop(guard);
+        keep_position,
+    }));
+}
+
+/// 工作线程的结果到达。过期的直接丢弃。
+fn on_search_done(done: Done) {
+    let current = UI.with(|c| c.borrow().as_ref().is_some_and(|u| u.seq.is_current(done.seq)));
+    if !current {
+        return;
+    }
+    let resp = done.response;
     let summary = Summary {
         total_hits: resp.total_hits,
         elapsed_ms: resp.elapsed_ms,
@@ -725,26 +744,68 @@ fn do_search() {
             ScopeStatus::DriveNotIndexed => Some(ScopeProblem::DriveNotIndexed),
         },
     };
-    show_results(q, resp.items, Vec::new(), summary);
+    UI.with(|c| {
+        if let Some(u) = c.borrow_mut().as_mut() {
+            u.shown_generation = resp.generation;
+        }
+    });
+    show_results(done.query, resp.items, Vec::new(), summary, done.keep_position);
+}
+
+/// 窗口可见且索引有变化时重新搜索。任何时候都不等写锁，忙就留到下一轮。
+fn refresh_if_stale() {
+    let Some((search, catalog, shown, query_empty, ready)) = UI.with(|c| {
+        c.borrow().as_ref().map(|u| {
+            (u.search_hwnd, u.catalog.clone(), u.shown_generation, u.query_text.is_empty(), u.index_ready)
+        })
+    }) else {
+        return;
+    };
+    if !unsafe { IsWindowVisible(search) }.as_bool() {
+        return;
+    }
+    if ready && !query_empty {
+        let generation = catalog.try_read().and_then(|g| g.as_ref().map(|cat| cat.generation()));
+        if generation.is_some_and(|g| g != shown) {
+            start_search(true);
+        }
+    }
+    refresh_view();
 }
 
 /// 显示一次搜索的结果。
-fn show_results(query: String, items: Vec<SearchResult>, tags: Vec<RowTag>, summary: Summary) {
+fn show_results(query: String, items: Vec<SearchResult>, tags: Vec<RowTag>, summary: Summary, keep_position: bool) {
     let Some(list) = UI.with(|c| c.borrow().as_ref().map(|u| u.list)) else {
         return;
     };
     let extra_h = if query.is_empty() { sc_dpi(16) + sc_dpi(22) * (HINTS.len() as i32 + 1) } else { 0 };
     UI.with(|c| {
         if let Some(ui) = c.borrow_mut().as_mut() {
+            let old_path = usize::try_from(ui.sel)
+                .ok()
+                .and_then(|i| ui.results.get(i))
+                .map(|r| r.path.clone());
+            let old_sel = ui.sel;
             ui.results = Rc::new(items);
             ui.row_tags = tags;
             ui.query_text = query;
             ui.summary = summary;
             ui.extra_h = extra_h;
-            ui.scroll_y = 0.0;
-            ui.target_y = 0.0;
-            ui.sel = if ui.results.is_empty() { -1 } else { 0 };
-            ui.hover = -1;
+            if keep_position {
+                ui.sel = reselect(old_path.as_deref(), old_sel, ui.results.iter().map(|r| r.path.as_str()));
+            } else {
+                ui.scroll_y = 0.0;
+                ui.target_y = 0.0;
+                ui.sel = if ui.results.is_empty() { -1 } else { 0 };
+                ui.hover = -1;
+            }
+        }
+    });
+    let max_scroll = geometry(list).max_scroll();
+    UI.with(|c| {
+        if let Some(ui) = c.borrow_mut().as_mut() {
+            ui.scroll_y = ui.scroll_y.min(max_scroll);
+            ui.target_y = ui.target_y.min(max_scroll);
         }
     });
     refresh_view();
@@ -859,7 +920,7 @@ fn persist_last_query() {
 }
 
 fn open_selected() {
-    let (search, sel) = match UI.with(|c| c.borrow().as_ref().map(|u| (u.search_hwnd, u.sel))) {
+    let (search, list, sel) = match UI.with(|c| c.borrow().as_ref().map(|u| (u.search_hwnd, u.list, u.sel))) {
         Some(t) => t,
         None => return,
     };
@@ -872,7 +933,7 @@ fn open_selected() {
     if let Some((path, is_dir)) = item {
         unsafe {
             open_path(&path, is_dir);
-            let _ = ShowWindow(search, SW_HIDE);
+            hide_window(search, list);
         }
     }
 }
@@ -911,6 +972,7 @@ pub fn toggle() {
             let _ = SetFocus(Some(edit));
             send(edit, EM_SETSEL, 0, -1);
             let _ = InvalidateRect(Some(search), None, true);
+            refresh_if_stale();
         }
     }
 }
@@ -1614,6 +1676,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_INDEX_PROGRESS => {
             refresh_view();
+            LRESULT(0)
+        }
+        WM_APP_SEARCH_DONE => {
+            let done = Box::from_raw(lp.0 as *mut Done);
+            on_search_done(*done);
+            LRESULT(0)
+        }
+        WM_APP_INDEX_TICK => {
+            refresh_if_stale();
+            LRESULT(0)
+        }
+        WM_APP_ICONS_READY => {
+            if let Some(list) = UI.with(|c| c.borrow().as_ref().map(|u| u.list)) {
+                let _ = InvalidateRect(Some(list), None, false);
+            }
             LRESULT(0)
         }
         WM_DRAWITEM => {

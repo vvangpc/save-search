@@ -27,9 +27,38 @@ pub fn moved(current: i32, how: SelMove, count: i32, page: i32) -> Option<i32> {
     Some(next.clamp(0, count - 1))
 }
 
+/// 后台刷新后的选中项：优先找同一路径，找不到时留在原来的位置（钳到有效范围）。
+pub fn reselect<'a>(
+    old_path: Option<&str>,
+    old_sel: i32,
+    new_paths: impl ExactSizeIterator<Item = &'a str>,
+) -> i32 {
+    let count = new_paths.len() as i32;
+    if count == 0 {
+        return -1;
+    }
+    if let Some(old) = old_path {
+        let mut paths = new_paths;
+        if let Some(i) = paths.position(|p| p == old) {
+            return i as i32;
+        }
+    }
+    old_sel.clamp(0, count - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reselect_follows_path_then_falls_back_to_position() {
+        let new = ["a", "b", "c"];
+        assert_eq!(reselect(Some("c"), 0, new.iter().copied()), 2);
+        assert_eq!(reselect(Some("gone"), 1, new.iter().copied()), 1);
+        assert_eq!(reselect(Some("gone"), 9, new.iter().copied()), 2);
+        assert_eq!(reselect(None, -1, new.iter().copied()), 0);
+        assert_eq!(reselect(Some("a"), 0, [].iter().copied()), -1);
+    }
 
     #[test]
     fn moves_are_clamped() {

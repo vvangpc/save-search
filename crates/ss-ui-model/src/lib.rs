@@ -6,7 +6,7 @@ mod seq;
 mod status;
 
 pub use scroll::{ease_toward, ListGeometry};
-pub use selection::{moved, SelMove};
+pub use selection::{moved, reselect, SelMove};
 pub use seq::RequestSeq;
 pub use status::{
     all_drives_label, banner, body, compact, grouped, status_line, Banner, Body, BuildProgress,

@@ -8,6 +8,7 @@
 mod dlgpopup;
 mod icons;
 mod paint;
+mod search_worker;
 mod searchwin;
 mod settings_win;
 mod theme;
@@ -75,7 +76,7 @@ pub(crate) fn synced_secs_ago() -> Option<u64> {
     }
 }
 
-fn post_to_search(msg: u32) {
+pub(crate) fn post_to_search(msg: u32) {
     let raw = SEARCH_HWND.load(Ordering::Relaxed);
     if raw != 0 {
         let h = HWND(raw as *mut core::ffi::c_void);
@@ -332,6 +333,7 @@ fn main() -> windows::core::Result<()> {
         let _ = CACHE_DIR.set(cache_dir.clone());
         let search_hwnd = searchwin::init(catalog.clone())?;
         SEARCH_HWND.store(search_hwnd.0 as isize, Ordering::Relaxed);
+        icons::start(|| post_to_search(searchwin::WM_APP_ICONS_READY));
         {
             let catalog2 = catalog.clone();
             let cache2 = cache_dir.clone();
@@ -384,6 +386,7 @@ fn main() -> windows::core::Result<()> {
                     if all_read {
                         LAST_SYNC.store(unix_now(), Ordering::Relaxed);
                     }
+                    post_to_search(searchwin::WM_APP_INDEX_TICK);
 
                     // 墓碑回收：长时程高频增删会让被删节点（墓碑）无限累积，内存只增不减。
                     // 超阈值（>活跃 25% 且 >10 万）→ 锁外全量重建该盘，短写锁换入。
@@ -405,6 +408,7 @@ fn main() -> windows::core::Result<()> {
                             if let Some(c) = catalog3.write().as_mut() {
                                 c.replace_index(idx);
                             }
+                            post_to_search(searchwin::WM_APP_INDEX_TICK);
                         }
                     }
                 }
