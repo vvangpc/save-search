@@ -8,6 +8,9 @@
 //! 天然稠密、上界 ≈ 卷历史峰值文件数，故用 `Vec<u32>` 直接按记录号索引（4 B/槽）替代
 //! `HashMap<u64,u32>`（≈17 B/桶且按 2 的幂膨胀），序列号另存每节点 2 B 用于校验记录被复用。
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+
 use crate::category::Category;
 
 /// 节点标志位。
@@ -238,10 +241,33 @@ fn stem_of(name: &[u8], is_dir: bool) -> &[u8] {
     }
 }
 
-/// 候选收集上限：兜底极端泛查询（如单字符），限制内存/CPU。
-const CAND_CAP_MIN: usize = 2000;
-fn cand_cap(limit: usize) -> usize {
-    limit.saturating_mul(20).max(CAND_CAP_MIN)
+impl ScoreKey {
+    /// 不需要沿父链或分配内存就能得到的字段。
+    #[inline]
+    fn cheap(&self) -> (bool, bool, bool, bool) {
+        (self.not_exact, self.not_stem_exact, self.not_prefix, self.not_dir)
+    }
+}
+
+/// 一次扫描的结果：最好的若干条（未排序）和全部命中数。
+#[derive(Default)]
+struct Scan {
+    hits: Vec<(ScoreKey, u32)>,
+    total_hits: usize,
+}
+
+/// `name` 是否以 `lower`（已小写）开头，ASCII 大小写不敏感。
+#[inline]
+fn starts_with_ci(name: &[u8], lower: &[u8]) -> bool {
+    name.len() >= lower.len() && name[..lower.len()].eq_ignore_ascii_case(lower)
+}
+
+/// 按小写形式比较 `name` 和已小写的 `lower`，不分配内存。
+#[inline]
+fn cmp_name_lower(name: &[u8], lower: &[u8]) -> Ordering {
+    name.iter()
+        .map(|b| b.to_ascii_lowercase())
+        .cmp(lower.iter().copied())
 }
 
 /// 节点数达到此值才分线程扫描（小索引单线程更快：省线程创建开销）。
@@ -526,8 +552,8 @@ impl Index {
         d
     }
 
-    /// 在 id 区间 `[lo, hi)` 内收集命中候选（仅 id + 打分键，不建路径字符串）。
-    /// 命中数达 `cap` 即停、返回 `truncated=true`。
+    /// 在 id 区间 `[lo, hi)` 内做全量扫描：统计全部命中数，只保留最好的 `limit` 条。
+    /// 比堆顶差的命中不计算深度、不分配小写名，所以泛查询的开销主要在名字匹配上。
     fn collect_range(
         &self,
         lo: u32,
@@ -535,10 +561,10 @@ impl Index {
         terms: &[CompiledTerm],
         category: Category,
         ancestor: Option<u32>,
-        cap: usize,
-    ) -> (Vec<(ScoreKey, u32)>, bool) {
-        let mut out: Vec<(ScoreKey, u32)> = Vec::new();
-        let mut truncated = false;
+        limit: usize,
+    ) -> Scan {
+        let mut heap: BinaryHeap<(ScoreKey, u32)> = BinaryHeap::new();
+        let mut total_hits = 0usize;
         // 只有「单词且无通配」才可能构成完全/前缀匹配（多词或含通配恒不算）。
         let single_plain = terms.len() == 1 && !terms[0].has_wild;
         for id in lo..hi {
@@ -558,50 +584,62 @@ impl Index {
                     continue;
                 }
             }
-            let name_lower: Vec<u8> = nb.iter().map(|b| b.to_ascii_lowercase()).collect();
-            let not_exact = !(single_plain && name_lower == terms[0].lower);
-            let not_stem_exact =
-                !(single_plain && stem_of(&name_lower, is_dir) == terms[0].lower.as_slice());
-            let not_prefix = if terms[0].has_wild {
-                true
-            } else {
-                !name_lower.starts_with(&terms[0].lower)
-            };
-            out.push((
-                ScoreKey {
-                    not_exact,
-                    not_stem_exact,
-                    not_prefix,
-                    not_dir: !is_dir,
-                    depth: self.depth_of(id),
-                    name_lower,
-                },
-                id,
-            ));
-            if out.len() >= cap {
-                truncated = true;
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "SaveSearch 搜索候选达上限 {}（盘 {}），尾部未排序候选被丢弃",
-                    cap,
-                    self.drive_letter()
-                );
-                break;
+            total_hits += 1;
+            if limit == 0 {
+                continue;
             }
+
+            let first = &terms[0];
+            let not_exact = !(single_plain && nb.eq_ignore_ascii_case(&first.lower));
+            let not_stem_exact =
+                !(single_plain && stem_of(nb, is_dir).eq_ignore_ascii_case(&first.lower));
+            let not_prefix = first.has_wild || !starts_with_ci(nb, &first.lower);
+            let not_dir = !is_dir;
+            let cheap = (not_exact, not_stem_exact, not_prefix, not_dir);
+
+            let mut known_depth = None;
+            if heap.len() == limit {
+                let (top, _) = heap.peek().expect("limit > 0 时满堆非空");
+                let order = cheap.cmp(&top.cheap()).then_with(|| {
+                    let depth = self.depth_of(id);
+                    known_depth = Some(depth);
+                    depth
+                        .cmp(&top.depth)
+                        .then_with(|| cmp_name_lower(nb, &top.name_lower))
+                });
+                // 名字也相同时后扫描到的 id 更大，同样排在堆顶之后。
+                if order != Ordering::Less {
+                    continue;
+                }
+                heap.pop();
+            }
+            let depth = known_depth.unwrap_or_else(|| self.depth_of(id));
+            let key = ScoreKey {
+                not_exact,
+                not_stem_exact,
+                not_prefix,
+                not_dir,
+                depth,
+                name_lower: nb.to_ascii_lowercase(),
+            };
+            heap.push((key, id));
         }
-        (out, truncated)
+        Scan {
+            hits: heap.into_vec(),
+            total_hits,
+        }
     }
 
-    /// 收集命中候选（仅 id + 打分键）。大索引按 id 区间切成多段并行扫描（作用域线程，
-    /// 每次搜索建/收线程约几十微秒，远小于扫描本身），各段独立受 `cap` 限制。
-    /// `terms` 须非空（由调用方保证）。`ancestor=Some` 时只取该子树后代。
+    /// 全量扫描。大索引按 id 区间切成多段并行（作用域线程，每次搜索建/收线程约几十微秒，
+    /// 远小于扫描本身），每段独立保留前 `limit` 条。全局前 `limit` 条一定在各段前
+    /// `limit` 条的并集里。`terms` 须非空（由调用方保证）。`ancestor=Some` 时只取该子树。
     fn collect_scored(
         &self,
         terms: &[CompiledTerm],
         category: Category,
         ancestor: Option<u32>,
-        cap: usize,
-    ) -> (Vec<(ScoreKey, u32)>, bool) {
+        limit: usize,
+    ) -> Scan {
         let n = self.names_len.len();
         let threads = if n >= PAR_MIN_NODES {
             std::thread::available_parallelism()
@@ -612,7 +650,7 @@ impl Index {
             1
         };
         if threads <= 1 || n < 2 {
-            return self.collect_range(1, n as u32, terms, category, ancestor, cap);
+            return self.collect_range(1, n as u32, terms, category, ancestor, limit);
         }
         let chunk = n.div_ceil(threads);
         std::thread::scope(|s| {
@@ -620,17 +658,16 @@ impl Index {
                 .map(|t| {
                     let lo = (t * chunk).max(1).min(n) as u32;
                     let hi = ((t + 1) * chunk).min(n) as u32;
-                    s.spawn(move || self.collect_range(lo, hi, terms, category, ancestor, cap))
+                    s.spawn(move || self.collect_range(lo, hi, terms, category, ancestor, limit))
                 })
                 .collect();
-            let mut out = Vec::new();
-            let mut truncated = false;
+            let mut out = Scan::default();
             for h in handles {
-                let (v, t) = h.join().unwrap_or_default();
-                out.extend(v);
-                truncated |= t;
+                let part = h.join().unwrap_or_default();
+                out.hits.extend(part.hits);
+                out.total_hits += part.total_hits;
             }
-            (out, truncated)
+            out
         })
     }
 
@@ -657,7 +694,7 @@ impl Index {
         c.into_iter().map(|(_, id)| self.materialize(id)).collect()
     }
 
-    /// 供多盘合并：返回单盘 cap 内、已排序并截到 `limit` 的 `(键, id)`，不还原字符串。
+    /// 供多盘合并：返回单盘已排序并截到 `limit` 的 `(键, id)`，不还原字符串。
     /// 全局 top-limit ⊆ 各盘 top-limit 的并集，故先截可减少合并量。
     pub(crate) fn collect_sorted(
         &self,
@@ -670,8 +707,8 @@ impl Index {
         if terms.is_empty() {
             return Vec::new();
         }
-        let (mut c, _) = self.collect_scored(&terms, category, ancestor, cand_cap(limit));
-        c.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut c = self.collect_scored(&terms, category, ancestor, limit).hits;
+        c.sort_unstable();
         c.truncate(limit);
         c
     }
@@ -1161,19 +1198,37 @@ mod tests {
     }
 
     #[test]
-    fn cap_truncates_candidates() {
+    fn exact_match_after_many_hits_ranks_first() {
+        // 旧实现命中 4000 条就停止扫描，排在后面的完全匹配会丢失。
+        let mut b = IndexBuilder::new(b'C');
+        for i in 0..50_000u64 {
+            b.push(1000 + i, 5, 0, &format!("report_{i}.txt"));
+        }
+        b.push(60_000, 5, 0, "report");
+        let idx = b.finish();
+        let r = idx.search("report", Category::All, 10);
+        assert_eq!(r.len(), 10);
+        assert_eq!(r[0].name, "report");
+    }
+
+    #[test]
+    fn scan_counts_all_hits_but_keeps_only_limit() {
         let mut b = IndexBuilder::new(b'C');
         for i in 0..30u64 {
             b.push(1000 + i, 5, 0, "x.txt");
         }
         let idx = b.finish();
         let terms = compile_query("x");
-        let (cands, trunc) = idx.collect_scored(&terms, Category::All, None, 10);
-        assert_eq!(cands.len(), 10);
-        assert!(trunc);
-        let (cands2, trunc2) = idx.collect_scored(&terms, Category::All, None, 100);
-        assert_eq!(cands2.len(), 30);
-        assert!(!trunc2);
+        let scan = idx.collect_scored(&terms, Category::All, None, 10);
+        assert_eq!(scan.hits.len(), 10);
+        assert_eq!(scan.total_hits, 30);
+        // 完全相同的键按 id 决定先后，保留最小的 10 个 id
+        let mut ids: Vec<u32> = scan.hits.iter().map(|(_, id)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=10).collect::<Vec<u32>>());
+        let scan = idx.collect_scored(&terms, Category::All, None, 100);
+        assert_eq!(scan.hits.len(), 30);
+        assert_eq!(idx.collect_scored(&terms, Category::All, None, 0).total_hits, 30);
     }
 
     #[test]
@@ -1188,13 +1243,59 @@ mod tests {
         }
         let idx = b.finish();
         let terms = compile_query("hit");
-        let (par, _) = idx.collect_scored(&terms, Category::All, None, 1_000_000);
-        let (single, _) = idx.collect_range(1, idx.len() as u32, &terms, Category::All, None, 1_000_000);
-        let mut a: Vec<u32> = par.into_iter().map(|(_, id)| id).collect();
-        let mut c: Vec<u32> = single.into_iter().map(|(_, id)| id).collect();
+        let par = idx.collect_scored(&terms, Category::All, None, 1_000_000);
+        let single = idx.collect_range(1, idx.len() as u32, &terms, Category::All, None, 1_000_000);
+        assert_eq!(par.total_hits, single.total_hits);
+        let mut a: Vec<u32> = par.hits.into_iter().map(|(_, id)| id).collect();
+        let mut c: Vec<u32> = single.hits.into_iter().map(|(_, id)| id).collect();
         a.sort_unstable();
         c.sort_unstable();
         assert_eq!(a, c);
         assert_eq!(a.len(), (n as usize).div_ceil(997));
+
+        // 只保留前几条时，多线程和单线程的结果和顺序也一致
+        let mut par = idx.collect_scored(&terms, Category::All, None, 50).hits;
+        let mut single = idx.collect_range(1, idx.len() as u32, &terms, Category::All, None, 50).hits;
+        par.sort_unstable();
+        par.truncate(50);
+        single.sort_unstable();
+        assert_eq!(
+            par.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            single.iter().map(|(_, id)| *id).collect::<Vec<_>>()
+        );
+    }
+
+    /// 合成性能测试：`cargo test --release -p ss-core -- --ignored --nocapture`。
+    #[test]
+    #[ignore = "合成性能测试，单独运行"]
+    fn perf_single_char_query_on_2m_nodes() {
+        const WORDS: &[&str] = &["report", "final", "backup", "image", "报告", "项目", "data", "notes"];
+        const EXTS: &[&str] = &["txt", "pdf", "docx", "png", "zip", "dll", "exe", "log"];
+        let n = 2_000_000u64;
+        let mut b = IndexBuilder::new(b'C');
+        b.reserve(n as usize);
+        b.push(100, 5, FILE_ATTRIBUTE_DIRECTORY, "root");
+        for i in 0..n {
+            let w1 = WORDS[(i % 8) as usize];
+            let w2 = WORDS[((i >> 3) % 8) as usize];
+            let ext = EXTS[((i >> 6) % 8) as usize];
+            let parent = if i % 20 == 0 { 100 } else { 1000 + (i / 20) * 20 };
+            let attrs = if i % 20 == 0 { FILE_ATTRIBUTE_DIRECTORY } else { 0 };
+            b.push(1000 + i, parent, attrs, &format!("{w1}_{w2}_{i}.{ext}"));
+        }
+        let idx = b.finish();
+        for q in ["a", "e", "t", "0"] {
+            let mut times: Vec<_> = (0..7)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    assert_eq!(idx.search(q, Category::All, 200).len(), 200);
+                    t.elapsed()
+                })
+                .collect();
+            times.sort_unstable();
+            let median = times[times.len() / 2];
+            eprintln!("单字符查询 {q:?}：中位 {median:.2?}，最慢 {:.2?}", times[times.len() - 1]);
+            assert!(median.as_millis() <= 150, "查询 {q:?} 中位 {median:?} 超过 150 ms");
+        }
     }
 }

@@ -235,7 +235,7 @@ impl Catalog {
                 merged.push((k, di, id));
             }
         }
-        merged.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        merged.sort_unstable();
         merged.truncate(limit);
         merged
             .into_iter()
