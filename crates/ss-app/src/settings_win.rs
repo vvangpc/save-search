@@ -1,5 +1,5 @@
-//! 设置窗口：主题 / 索引盘符 / 开机自启 / 结果上限 / 最近条数 / 浮窗开关与显示项。
-//! 保存即写 settings.json 并即时应用（主题立即重绘；上限/最近/浮窗项下次读取生效；
+//! 设置窗口：索引盘符 / 开机自启 / 结果上限 / 最近条数 / 浮窗开关与显示项。
+//! 保存即写 settings.json 并即时应用（上限/最近/浮窗项下次读取生效；
 //! 盘符更改重启后生效；开机自启立即建/删计划任务）。
 
 use std::cell::RefCell;
@@ -19,7 +19,6 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::theme;
 
-const ID_THEME: u32 = 1001;
 const ID_AUTOSTART: u32 = 1002;
 const ID_LIMIT: u32 = 1003;
 const ID_RECENT: u32 = 1004;
@@ -36,9 +35,6 @@ const IDCANCEL: u32 = 2;
 
 const BM_GETCHECK: u32 = 0x00F0;
 const BM_SETCHECK: u32 = 0x00F1;
-const CB_ADDSTRING: u32 = 0x0143;
-const CB_SETCURSEL: u32 = 0x014E;
-const CB_GETCURSEL: u32 = 0x0147;
 
 mod st {
     pub const WS_CHILD: u32 = 0x4000_0000;
@@ -47,7 +43,6 @@ mod st {
     pub const WS_VSCROLL: u32 = 0x0020_0000;
     pub const BS_AUTOCHECKBOX: u32 = 0x0003;
     pub const BS_DEFPUSHBUTTON: u32 = 0x0001;
-    pub const CBS_DROPDOWNLIST: u32 = 0x0003;
     pub const WS_BORDER: u32 = 0x0080_0000;
     pub const LBS_NOTIFY: u32 = 0x0001;
     pub const LBS_HASSTRINGS: u32 = 0x0040;
@@ -59,15 +54,8 @@ mod st {
     pub const WS_OVERLAPPED_DLG: u32 = 0x00CC_0000; // caption | sysmenu | border
 }
 
-const THEMES: [(&str, &str); 3] = [
-    ("business_light", "商务浅色"),
-    ("business_dark", "商务深色"),
-    ("solarized", "暖阳浅色"),
-];
-
 struct SUi {
     hwnd: HWND,
-    theme_combo: HWND,
     autostart: HWND,
     limit: HWND,
     recent: HWND,
@@ -177,7 +165,7 @@ unsafe fn create() -> windows::core::Result<()> {
 
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);
-    let (ww, wh) = (460, 660);
+    let (ww, wh) = (460, 620);
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         class,
@@ -241,34 +229,6 @@ unsafe fn create() -> windows::core::Result<()> {
     };
 
     let mut y = 14;
-    mklabel("主题", 16, y + 3, 60);
-    let theme_combo = CreateWindowExW(
-        WINDOW_EX_STYLE(0),
-        w!("COMBOBOX"),
-        PCWSTR::null(),
-        WINDOW_STYLE(st::WS_CHILD | st::WS_VISIBLE | st::WS_TABSTOP | st::WS_VSCROLL | st::CBS_DROPDOWNLIST),
-        sc(90),
-        sc(y),
-        sc(330),
-        sc(200),
-        Some(hwnd),
-        Some(HMENU(ID_THEME as usize as *mut c_void)),
-        Some(hinstance),
-        None,
-    )?;
-    send(theme_combo, WM_SETFONT, font.0 as usize, 1);
-    for (i, (name, label)) in THEMES.iter().enumerate() {
-        let wl = crate::wide(label);
-        send(theme_combo, CB_ADDSTRING, 0, wl.as_ptr() as isize);
-        if *name == s.theme {
-            send(theme_combo, CB_SETCURSEL, i, 0);
-        }
-    }
-    if send(theme_combo, CB_GETCURSEL, 0, 0) < 0 {
-        send(theme_combo, CB_SETCURSEL, 0, 0);
-    }
-
-    y += 40;
     mklabel("索引盘符（不勾=全部 NTFS，改动重启生效）", 16, y, 400);
     y += 24;
     let mut drives = Vec::new();
@@ -425,7 +385,6 @@ unsafe fn create() -> windows::core::Result<()> {
     SUI.with(|c| {
         *c.borrow_mut() = Some(SUi {
             hwnd,
-            theme_combo,
             autostart,
             limit,
             recent,
@@ -439,7 +398,7 @@ unsafe fn create() -> windows::core::Result<()> {
         });
     });
 
-    theme::apply_window(hwnd, &theme::current());
+    theme::apply_window(hwnd);
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = SetForegroundWindow(hwnd);
     Ok(())
@@ -449,8 +408,6 @@ fn apply_and_close() {
     let s = SUI.with(|c| {
         let b = c.borrow();
         let u = b.as_ref()?;
-        let theme_idx = send(u.theme_combo, CB_GETCURSEL, 0, 0).max(0) as usize;
-        let theme = THEMES.get(theme_idx).map(|t| t.0).unwrap_or("business_light");
         let drives: Vec<char> = u
             .drives
             .iter()
@@ -466,7 +423,6 @@ fn apply_and_close() {
         let limit = get_text(u.limit).trim().parse::<usize>().unwrap_or(200).clamp(1, 100_000);
         let recent_max = get_text(u.recent).trim().parse::<usize>().unwrap_or(2).min(100);
         Some(ss_config::Settings {
-            theme: theme.to_string(),
             indexed_drives: drives,
             preset_folders: listbox_items(u.preset_list),
             result_limit: limit,
@@ -483,8 +439,6 @@ fn apply_and_close() {
     if let Some(s) = s {
         let autostart_changed = ss_config::load_settings().autostart != s.autostart;
         ss_config::save_settings(&s);
-        theme::set_current(theme::theme_by_name(&s.theme));
-        crate::searchwin::refresh_theme();
         crate::searchwin::refresh_scopes(); // 预设文件夹变更后刷新下拉
         // schtasks 要起子进程、数百毫秒；未改动时不跑，避免每次保存都卡一下
         if autostart_changed {

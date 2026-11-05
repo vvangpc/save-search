@@ -350,7 +350,7 @@ pub fn init(catalog: SharedCatalog) -> windows::core::Result<HWND> {
             });
         });
 
-        theme::apply_window(hwnd, &theme::current());
+        theme::apply_window(hwnd);
         layout(hwnd);
         // 跨重启记忆：预填上次搜索词（显示时由 toggle 全选，用户打字即整体覆盖）
         let last = ss_config::last_query();
@@ -609,23 +609,12 @@ pub fn toggle() {
         if IsWindowVisible(search).as_bool() {
             hide_window(search, list);
         } else {
-            theme::apply_window(search, &theme::current());
             center(search);
             let _ = ShowWindow(search, SW_SHOW);
             let _ = SetForegroundWindow(search);
             let _ = SetFocus(Some(edit));
             send(edit, EM_SETSEL, 0, -1);
             let _ = InvalidateRect(Some(search), None, true);
-        }
-    }
-}
-
-pub fn refresh_theme() {
-    if let Some((search, _, list)) = handles() {
-        unsafe {
-            theme::apply_window(search, &theme::current());
-            let _ = InvalidateRect(Some(search), None, true);
-            let _ = InvalidateRect(Some(list), None, false);
         }
     }
 }

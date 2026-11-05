@@ -237,9 +237,7 @@ fn main() -> windows::core::Result<()> {
         // COM STA（IShellWindows 枚举 / UI Automation 导航需要）
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
 
-        // 读取设置并应用主题
         let settings = ss_config::load_settings();
-        theme::set_current(theme::theme_by_name(&settings.theme));
 
         let hmodule = GetModuleHandleW(None)?;
         let hinstance = HINSTANCE(hmodule.0);

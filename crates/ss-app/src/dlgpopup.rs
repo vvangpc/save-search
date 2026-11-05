@@ -148,6 +148,7 @@ pub fn init() -> windows::core::Result<()> {
         // 初始化、行高取了 96dpi 兜底值 40，高 DPI 下与 reposition 的窗口尺寸计算
         // 不一致（条目偏矮、底部留白）；这里用真实 DPI 重设。
         send(list, LB_SETITEMHEIGHT, 0, (dpi * 40 / 96) as isize);
+        theme::apply_window(hwnd);
         Ok(())
     }
 }
@@ -184,7 +185,6 @@ pub fn show_for(dialog: HWND, entries: Vec<(EntryKind, String)>) {
                 p.entries = entries;
             }
         });
-        theme::apply_window(hwnd, &theme::current());
     }
     reposition(dialog, hwnd, list);
     unsafe {
