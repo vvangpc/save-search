@@ -1,4 +1,4 @@
-<img src="assets/generated/savesearch-app-icon-concept.png" width="120" align="right" alt="SaveSearch icon"/>
+<img src="assets/app-icon.png" width="120" align="right" alt="SaveSearch icon"/>
 
 # SaveSearch
 
@@ -8,7 +8,7 @@
 
 > Windows 10/11 常驻托盘小工具：NTFS 毫秒级文件搜索 + 「保存 / 打开」对话框位置快选。
 
-单个 exe（约 0.78 MB，静态链接、无运行时依赖），用 **Rust + [windows-rs](https://github.com/microsoft/windows-rs)** 编写，
+单个 exe（约 0.69 MB，静态链接、无运行时依赖），用 **Rust + [windows-rs](https://github.com/microsoft/windows-rs)** 编写，
 原生 Win32 自绘界面，250 万文件常驻索引内存约 102 MB。
 
 - **🔍 搜索**：`Alt + Space` 呼出（可在设置里改键），输入即搜，200 万文件约 15 ms 出结果。
@@ -168,7 +168,7 @@ cargo run --release -p ss-core --example scan -- C explorer
 cargo run --release -p ss-core --example cache
 cargo run --release -p ss-core --example cat
 
-# 从源图重新生成应用图标（需 Python + Pillow）
+# 重新生成应用图标（需 Python + Pillow）
 python tools/make_icon.py
 ```
 
