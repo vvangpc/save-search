@@ -7,9 +7,11 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::category::{Category, CategoryCounts};
-use crate::drives::ntfs_fixed_drives;
+use crate::drives::{list_volumes, ntfs_fixed_drives};
 use crate::index::{compile_query, Change, Index, ScanSpec, ScoreKey, SearchResult};
-use crate::mft::{build_index_for_drive, current_usn_state, read_changes};
+use crate::mft::{
+    build_index_for_drive, build_index_for_drive_with_progress, current_usn_state, read_changes,
+};
 use crate::persist;
 
 /// 搜索范围。
@@ -29,6 +31,29 @@ pub enum ScopeStatus {
     FolderMissing,
     DriveNotIndexed,
 }
+
+/// 一个盘的索引状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveState {
+    /// 正在读取缓存。
+    Loading,
+    /// 正在枚举 MFT。`estimated` 来自 MFT 大小，取不到时为 0；最终数量通常小于它。
+    Building { done: usize, estimated: usize },
+    Ready,
+    Failed { reason: String },
+}
+
+/// 一个盘的状态和最近一次不影响使用的错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveStatus {
+    pub letter: char,
+    pub state: DriveState,
+    /// 索引仍可搜索，但可能不是最新（例如读取 USN 日志失败）。成功追赶后清除。
+    pub last_error: Option<String>,
+}
+
+/// 加载结果：索引和不影响使用的错误。
+type LoadedDrive = (Index, Option<String>);
 
 /// 一次搜索请求。
 pub struct SearchRequest<'a> {
@@ -65,6 +90,8 @@ pub struct Catalog {
     /// 命中时用 `Index::is_live_dir_at` 反查路径校验（目录被删/改名/重建即失效重解析）。
     folder_cache: Mutex<Option<(String, usize, u32)>>,
     generation: u64,
+    /// 按盘符排序的状态，包含加载失败、没有索引的盘。
+    statuses: Vec<DriveStatus>,
 }
 
 fn cache_path(dir: &Path, letter: char) -> PathBuf {
@@ -73,8 +100,17 @@ fn cache_path(dir: &Path, letter: char) -> PathBuf {
 
 impl Catalog {
     fn from_indexes(indexes: Vec<Index>) -> Catalog {
+        let statuses = indexes
+            .iter()
+            .map(|i| DriveStatus {
+                letter: i.drive_letter(),
+                state: DriveState::Ready,
+                last_error: None,
+            })
+            .collect();
         Catalog {
             indexes,
+            statuses,
             folder_cache: Mutex::new(None),
             generation: 0,
         }
@@ -82,52 +118,125 @@ impl Catalog {
 
     /// 仅全量构建（不读写缓存），用于测试/示例。
     pub fn build_all() -> Catalog {
-        let mut indexes = Vec::new();
+        let mut cat = Self::from_indexes(Vec::new());
         for letter in ntfs_fixed_drives() {
-            if let Ok(idx) = build_index_for_drive(letter) {
-                indexes.push(idx);
+            match build_index_for_drive(letter) {
+                Ok(idx) => cat.push_loaded(idx, None),
+                Err(e) => cat.push_failed(letter, e.to_string()),
             }
         }
-        Self::from_indexes(indexes)
+        cat
     }
 
     /// 优先从缓存加载并做 USN 追赶；缓存无效则全量重建并写缓存。
     /// `only` 非空时只索引其中的盘符（大写）；空 = 全部固定 NTFS 盘。
     /// 各盘并行加载/构建（缓存读取与 MFT 枚举都是 I/O 为主，多盘可叠加）。
     pub fn build_or_load(cache_dir: &Path, only: &[char]) -> Catalog {
+        Self::build_or_load_with_progress(cache_dir, only, &|_, _| {})
+    }
+
+    /// 同 [`build_or_load`](Self::build_or_load)，并通过 `on_event` 报告每个盘的状态变化。
+    /// `on_event` 可能在各盘的工作线程上调用。结果也可以之后用
+    /// [`drive_statuses`](Self::drive_statuses) 查询。实盘行为用 `examples/volumes.rs` 人工验证。
+    pub fn build_or_load_with_progress(
+        cache_dir: &Path,
+        only: &[char],
+        on_event: &(dyn Fn(char, DriveState) + Sync),
+    ) -> Catalog {
         let _ = std::fs::create_dir_all(cache_dir);
         let only_up: Vec<char> = only.iter().map(|c| c.to_ascii_uppercase()).collect();
         let letters: Vec<char> = ntfs_fixed_drives()
             .into_iter()
             .filter(|l| only_up.is_empty() || only_up.contains(l))
             .collect();
-        let indexes: Vec<Index> = std::thread::scope(|s| {
+        let outcomes: Vec<(char, Result<LoadedDrive, String>)> = std::thread::scope(|s| {
             let handles: Vec<_> = letters
                 .iter()
-                .map(|&letter| s.spawn(move || Self::load_or_build(cache_dir, letter)))
+                .map(|&letter| {
+                    (
+                        letter,
+                        s.spawn(move || Self::load_or_build(cache_dir, letter, on_event)),
+                    )
+                })
                 .collect();
             handles
                 .into_iter()
-                .filter_map(|h| h.join().ok().flatten())
+                .map(|(letter, h)| {
+                    let outcome = h
+                        .join()
+                        .unwrap_or_else(|_| Err("索引线程异常退出".to_string()));
+                    (letter, outcome)
+                })
                 .collect()
         });
-        Self::from_indexes(indexes)
+
+        let mut cat = Self::from_indexes(Vec::new());
+        for (letter, outcome) in outcomes {
+            match outcome {
+                Ok((idx, warning)) => cat.push_loaded(idx, warning),
+                Err(reason) => {
+                    on_event(letter, DriveState::Failed { reason: reason.clone() });
+                    cat.push_failed(letter, reason);
+                }
+            }
+        }
+        // 用户选了但当前不可索引的盘（已拔出、换了文件系统）也要给出原因。
+        for letter in only_up {
+            if !letters.contains(&letter) && !cat.statuses.iter().any(|s| s.letter == letter) {
+                let reason = list_volumes()
+                    .into_iter()
+                    .find(|v| v.letter == letter)
+                    .and_then(|v| v.reason)
+                    .unwrap_or_else(|| "盘不存在".to_string());
+                on_event(letter, DriveState::Failed { reason: reason.clone() });
+                cat.push_failed(letter, reason);
+            }
+        }
+        cat.statuses.sort_by_key(|s| s.letter);
+        cat
     }
 
-    fn load_or_build(cache_dir: &Path, letter: char) -> Option<Index> {
-        if let Some(idx) = Self::try_load(cache_dir, letter) {
-            return Some(idx);
+    fn push_loaded(&mut self, idx: Index, warning: Option<String>) {
+        self.statuses.push(DriveStatus {
+            letter: idx.drive_letter(),
+            state: DriveState::Ready,
+            last_error: warning,
+        });
+        self.indexes.push(idx);
+    }
+
+    fn push_failed(&mut self, letter: char, reason: String) {
+        self.statuses.push(DriveStatus {
+            letter,
+            state: DriveState::Failed { reason },
+            last_error: None,
+        });
+    }
+
+    /// 加载或构建一个盘。成功时附带不影响使用的错误（USN 追赶失败、缓存写入失败）。
+    fn load_or_build(
+        cache_dir: &Path,
+        letter: char,
+        on_event: &(dyn Fn(char, DriveState) + Sync),
+    ) -> Result<LoadedDrive, String> {
+        on_event(letter, DriveState::Loading);
+        if let Some(loaded) = Self::try_load(cache_dir, letter) {
+            on_event(letter, DriveState::Ready);
+            return Ok(loaded);
         }
-        let idx = build_index_for_drive(letter).ok()?;
-        if let Err(_e) = persist::save_index(&idx, &cache_path(cache_dir, letter)) {
-            #[cfg(debug_assertions)]
-            eprintln!("SaveSearch 保存索引({letter})失败: {}", _e);
-        }
-        Some(idx)
+        let idx = build_index_for_drive_with_progress(letter, &|done, estimated| {
+            on_event(letter, DriveState::Building { done, estimated });
+        })
+        .map_err(|e| e.to_string())?;
+        let warning = persist::save_index(&idx, &cache_path(cache_dir, letter))
+            .err()
+            .map(|e| format!("保存索引缓存失败：{e}"));
+        on_event(letter, DriveState::Ready);
+        Ok((idx, warning))
     }
 
     /// 尝试加载某盘缓存并校验 + 追赶。失败返回 None（触发全量重建）。
-    fn try_load(cache_dir: &Path, letter: char) -> Option<Index> {
+    fn try_load(cache_dir: &Path, letter: char) -> Option<LoadedDrive> {
         let mut idx = persist::load_index(&cache_path(cache_dir, letter)).ok()?;
         let (serial, journal_id, first_usn, _next) = current_usn_state(letter).ok()?;
         // 卷变化 / 日志重建 / 缓存太旧（日志已截断）→ 全量重建
@@ -137,11 +246,15 @@ impl Catalog {
         if idx.next_usn() < first_usn {
             return None;
         }
-        if let Ok((changes, new_next)) = read_changes(letter, journal_id, idx.next_usn()) {
-            idx.apply_all(&changes);
-            idx.set_next_usn(new_next);
-        }
-        Some(idx)
+        let warning = match read_changes(letter, journal_id, idx.next_usn()) {
+            Ok((changes, new_next)) => {
+                idx.apply_all(&changes);
+                idx.set_next_usn(new_next);
+                None
+            }
+            Err(e) => Some(format!("读取文件变更失败：{e}")),
+        };
+        Some((idx, warning))
     }
 
     /// 各盘当前 USN 读取位置：(盘符, 日志ID, 起始USN)。
@@ -175,10 +288,17 @@ impl Catalog {
             let letter = idx.drive_letter();
             let jid = idx.usn_journal_id();
             let from = idx.next_usn();
-            if let Ok((changes, new_next)) = read_changes(letter, jid, from) {
-                total += changes.len();
-                changed |= idx.apply_all(&changes) > 0;
-                idx.set_next_usn(new_next);
+            let last_error = match read_changes(letter, jid, from) {
+                Ok((changes, new_next)) => {
+                    total += changes.len();
+                    changed |= idx.apply_all(&changes) > 0;
+                    idx.set_next_usn(new_next);
+                    None
+                }
+                Err(e) => Some(format!("读取文件变更失败：{e}")),
+            };
+            if let Some(status) = self.statuses.iter_mut().find(|s| s.letter == letter) {
+                status.last_error = last_error;
             }
         }
         if changed {
@@ -199,6 +319,7 @@ impl Catalog {
     /// 用新建索引替换同盘符旧索引（盘符不存在则追加）。
     /// 调用方持写锁；本函数只做换指针，旧索引在写锁内 drop。
     pub fn replace_index(&mut self, new_idx: Index) {
+        let new_idx_letter = new_idx.drive_letter();
         match self
             .indexes
             .iter_mut()
@@ -208,8 +329,36 @@ impl Catalog {
             None => self.indexes.push(new_idx),
         }
         self.generation += 1;
+        let letter = new_idx_letter;
+        self.statuses.retain(|s| s.letter != letter);
+        self.statuses.push(DriveStatus {
+            letter,
+            state: DriveState::Ready,
+            last_error: None,
+        });
+        self.statuses.sort_by_key(|s| s.letter);
         // 节点 id 已全部变化，文件夹解析缓存作废（校验也会拦住，这里直接清掉更省）
         *self.folder_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// 移除某盘的索引和状态，返回是否有变化。磁盘缓存不动，由调用方决定。
+    pub fn remove_drive(&mut self, letter: char) -> bool {
+        let letter = letter.to_ascii_uppercase();
+        let before = (self.indexes.len(), self.statuses.len());
+        self.indexes.retain(|i| i.drive_letter() != letter);
+        self.statuses.retain(|s| s.letter != letter);
+        if (self.indexes.len(), self.statuses.len()) == before {
+            return false;
+        }
+        self.generation += 1;
+        // 缓存里的盘下标已失效
+        *self.folder_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        true
+    }
+
+    /// 各盘的索引状态，包含加载失败的盘，按盘符排序。
+    pub fn drive_statuses(&self) -> Vec<DriveStatus> {
+        self.statuses.clone()
     }
 
     /// 保存所有盘索引到缓存。
@@ -468,6 +617,58 @@ mod tests {
         cat.replace_index(IndexBuilder::new(b'D').finish());
         assert_eq!(cat.generation(), g0 + 2);
         assert_eq!(cat.query(&req("new", Scope::All)).generation, g0 + 2);
+    }
+
+    #[test]
+    fn remove_drive_updates_scopes_status_and_generation() {
+        let mut cat = sample_catalog();
+        let g0 = cat.generation();
+        // 先让文件夹缓存指向 D 盘（下标 1），移除 C 后下标必须失效
+        assert_eq!(cat.query(&req("report", Scope::Folder("D:\\Work".into()))).items.len(), 1);
+        assert!(cat.remove_drive('c'));
+        assert_eq!(cat.generation(), g0 + 1);
+        assert_eq!(cat.drive_letters(), ['D']);
+        assert_eq!(cat.drive_statuses().len(), 1);
+        assert_eq!(
+            cat.query(&req("report", Scope::Drive('C'))).scope_status,
+            ScopeStatus::DriveNotIndexed
+        );
+        assert_eq!(cat.query(&req("report", Scope::Folder("D:\\Work".into()))).items.len(), 1);
+        // 再次移除：没有变化，不递增
+        assert!(!cat.remove_drive('C'));
+        assert_eq!(cat.generation(), g0 + 1);
+    }
+
+    #[test]
+    fn replace_index_marks_drive_ready() {
+        let mut cat = sample_catalog();
+        cat.push_failed('E', "拒绝访问".into());
+        assert!(matches!(
+            cat.drive_statuses().iter().find(|s| s.letter == 'E').unwrap().state,
+            DriveState::Failed { .. }
+        ));
+        cat.replace_index(IndexBuilder::new(b'E').finish());
+        let statuses = cat.drive_statuses();
+        assert_eq!(statuses.iter().map(|s| s.letter).collect::<Vec<_>>(), ['C', 'D', 'E']);
+        assert!(statuses.iter().all(|s| s.state == DriveState::Ready));
+    }
+
+    #[test]
+    fn selected_drive_that_is_absent_reports_failure() {
+        let used: Vec<char> = crate::drives::list_volumes().iter().map(|v| v.letter).collect();
+        let absent = ('A'..='Z').rev().find(|c| !used.contains(c)).expect("有未分配的盘符");
+        let dir = std::env::temp_dir().join(format!("ss-core-cat-test-{}", std::process::id()));
+        let events = Mutex::new(Vec::new());
+        let cat = Catalog::build_or_load_with_progress(&dir, &[absent], &|l, s| {
+            events.lock().unwrap().push((l, s));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(cat.is_empty());
+        let statuses = cat.drive_statuses();
+        assert_eq!(statuses.len(), 1);
+        let failed = DriveState::Failed { reason: "盘不存在".to_string() };
+        assert_eq!(statuses[0].state, failed);
+        assert_eq!(events.into_inner().unwrap(), [(absent, failed)]);
     }
 
     #[test]

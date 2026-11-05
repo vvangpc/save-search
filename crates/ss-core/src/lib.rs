@@ -10,8 +10,12 @@ mod index;
 mod mft;
 mod persist;
 
-pub use catalog::{Catalog, Scope, ScopeStatus, SearchRequest, SearchResponse};
+pub use catalog::{
+    Catalog, DriveState, DriveStatus, Scope, ScopeStatus, SearchRequest, SearchResponse,
+};
 pub use category::{classify, Category, CategoryCounts};
-pub use drives::ntfs_fixed_drives;
+pub use drives::{list_volumes, ntfs_fixed_drives, DriveKind, VolumeInfo};
 pub use index::{Change, Index, IndexBuilder, SearchResult, IS_DIR, ROOT_ID};
-pub use mft::{build_index_for_drive, current_usn_state, read_changes};
+pub use mft::{
+    build_index_for_drive, build_index_for_drive_with_progress, current_usn_state, read_changes,
+};

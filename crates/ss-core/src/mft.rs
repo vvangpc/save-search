@@ -280,6 +280,15 @@ pub fn read_changes(
 
 /// 枚举单个 NTFS 盘，构建索引并记录 USN 状态（供后续增量）。
 pub fn build_index_for_drive(letter: char) -> windows::core::Result<Index> {
+    build_index_for_drive_with_progress(letter, &|_, _| {})
+}
+
+/// 同 [`build_index_for_drive`]，每处理完一批记录调用一次 `on_progress(已处理, 估计总数)`。
+/// 估计总数来自 MFT 大小，取不到时为 0；MFT 里有空槽，所以最终数量通常小于估计值。
+pub fn build_index_for_drive_with_progress(
+    letter: char,
+    on_progress: &dyn Fn(usize, usize),
+) -> windows::core::Result<Index> {
     let handle = open_volume(letter)?;
 
     // 先记录当前 USN 高水位，全量扫描后从此处增量追赶（upsert 幂等，重叠无害）。
@@ -291,6 +300,7 @@ pub fn build_index_for_drive(letter: char) -> windows::core::Result<Index> {
     if est > 0 {
         builder.reserve(est);
     }
+    on_progress(0, est);
 
     const BUF_SIZE: usize = 1 << 20; // 1 MiB
     let mut out = vec![0u8; BUF_SIZE];
@@ -347,6 +357,7 @@ pub fn build_index_for_drive(letter: char) -> windows::core::Result<Index> {
             }
             offset += record_len;
         }
+        on_progress(builder.node_count(), est);
     }
 
     let mut index = builder.finish();

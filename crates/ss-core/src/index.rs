@@ -451,6 +451,11 @@ impl IndexBuilder {
         self.name_pool.reserve(n.saturating_mul(20));
     }
 
+    /// 已加入的节点数（含合成根）。
+    pub fn node_count(&self) -> usize {
+        self.names_len.len()
+    }
+
     #[inline]
     pub fn is_root_frn(frn: u64) -> bool {
         (frn & FRN_MASK) == NTFS_ROOT_FILE_NUMBER
