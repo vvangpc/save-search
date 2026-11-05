@@ -3,8 +3,13 @@
 //! - `explorer`：枚举已打开的资源管理器文件夹路径。
 //! - 后续：对话框检测（WinEvent）、UIA 导航。
 
+mod actions;
 mod dialog;
 mod explorer;
 
+pub use actions::{
+    copy_path, copy_text, open_deelevated, reveal, show_context_menu, show_properties, ActionError,
+    MenuOutcome,
+};
 pub use dialog::{is_file_dialog, navigate_dialog};
 pub use explorer::enumerate_open_folders;
