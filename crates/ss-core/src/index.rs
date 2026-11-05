@@ -98,17 +98,24 @@ fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
 struct CompiledTerm {
     lower: Vec<u8>,
     has_wild: bool,
+    /// 以 `*` 开头且不以 `*` 结尾：要求匹配到名字结尾（`*.txt` 不匹配 `a.txt.bak`）。
+    anchor_end: bool,
 }
 
-/// 把原始查询编译为词列表：按空白分词，每词预折叠小写并标记是否含通配符。
-/// 空白被 `split_ascii_whitespace` 吃掉，不产生空词；空查询返回空 Vec。
+/// 把原始查询编译为词列表：按 Unicode 空白分词（含全角空格 U+3000），每词预折叠小写
+/// 并标记通配符。空白不产生空词；空查询返回空 Vec。
 fn compile_query(query: &str) -> Vec<CompiledTerm> {
     query
-        .split_ascii_whitespace()
+        .split_whitespace()
         .map(|w| {
             let lower: Vec<u8> = w.bytes().map(|b| b.to_ascii_lowercase()).collect();
             let has_wild = lower.iter().any(|&b| b == b'*' || b == b'?');
-            CompiledTerm { lower, has_wild }
+            let anchor_end = lower.first() == Some(&b'*') && lower.last() != Some(&b'*');
+            CompiledTerm {
+                lower,
+                has_wild,
+                anchor_end,
+            }
         })
         .collect()
 }
@@ -116,7 +123,7 @@ fn compile_query(query: &str) -> Vec<CompiledTerm> {
 /// 单个词是否命中文件名：无通配=子串匹配（复用 `contains_ci`）；含通配=子串锚定 glob。
 fn term_matches(hay: &[u8], t: &CompiledTerm) -> bool {
     if t.has_wild {
-        wildcard_contains_ci(hay, &t.lower)
+        wildcard_contains_ci(hay, &t.lower, t.anchor_end)
     } else {
         contains_ci(hay, &t.lower)
     }
@@ -128,19 +135,39 @@ fn all_terms_match(hay: &[u8], terms: &[CompiledTerm]) -> bool {
 }
 
 /// 子串锚定的通配匹配：`pat` 能在 `hay` 任意起始位匹配即命中。`pat` 须已小写。
-/// `*`=任意多字符（含 0），`?`=任意一字符，其余按 ASCII 折叠大小写比较。
-fn wildcard_contains_ci(hay: &[u8], pat: &[u8]) -> bool {
-    for start in 0..=hay.len() {
-        if glob_at(&hay[start..], pat) {
-            return true;
-        }
+/// `*`=任意多字符（含 0），`?`=任意一个完整字符，其余按 ASCII 折叠大小写比较。
+/// `anchor_end` 见 [`CompiledTerm::anchor_end`]。
+fn wildcard_contains_ci(hay: &[u8], pat: &[u8], anchor_end: bool) -> bool {
+    // 开头的 `*` 已覆盖所有起点，只需从 0 试一次。
+    if pat.first() == Some(&b'*') {
+        return glob_at(hay, pat, anchor_end);
     }
-    false
+    // 只从字符边界开始，否则 `?` 会把半个多字节字符算成一个字符。
+    (0..=hay.len())
+        .filter(|&start| start == hay.len() || !is_utf8_continuation(hay[start]))
+        .any(|start| glob_at(&hay[start..], pat, anchor_end))
 }
 
-/// 从 `h` 开头匹配 glob `pat`；`pat` 消费完即成功（尾部自由 = 子串语义）。
-/// 经典「贪心 + 星号回溯」，无递归。
-fn glob_at(h: &[u8], pat: &[u8]) -> bool {
+#[inline]
+fn is_utf8_continuation(b: u8) -> bool {
+    b & 0xC0 == 0x80
+}
+
+/// 由 UTF-8 首字节得到字符的字节数。
+#[inline]
+fn utf8_char_len(first: u8) -> usize {
+    match first {
+        0xF0..=0xFF => 4,
+        0xE0..=0xEF => 3,
+        0xC0..=0xDF => 2,
+        _ => 1,
+    }
+}
+
+/// 从 `h` 开头匹配 glob `pat`。`anchor_end=false` 时 `pat` 消费完即成功（尾部自由 =
+/// 子串语义）；`anchor_end=true` 时还要求 `h` 也用尽，否则回溯到最近的 `*`。
+/// 经典「贪心 + 星号回溯」，无递归。`?` 和回溯都按完整 UTF-8 字符前进。
+fn glob_at(h: &[u8], pat: &[u8], anchor_end: bool) -> bool {
     let (mut hi, mut pi) = (0usize, 0usize);
     let mut star_pi: Option<usize> = None;
     let mut star_hi = 0usize;
@@ -155,7 +182,7 @@ fn glob_at(h: &[u8], pat: &[u8]) -> bool {
                 }
                 b'?' => {
                     if hi < h.len() {
-                        hi += 1;
+                        hi = (hi + utf8_char_len(h[hi])).min(h.len());
                         pi += 1;
                         continue;
                     }
@@ -168,15 +195,15 @@ fn glob_at(h: &[u8], pat: &[u8]) -> bool {
                     }
                 }
             }
-        } else {
-            return true; // pat 用尽即命中（不要求消费完 h）
+        } else if !anchor_end || hi == h.len() {
+            return true;
         }
         // 失配：回溯到最近的 '*'，多吞一个字符再试
         if let Some(sp) = star_pi {
-            star_hi += 1;
-            if star_hi > h.len() {
+            if star_hi >= h.len() {
                 return false;
             }
+            star_hi = (star_hi + utf8_char_len(h[star_hi])).min(h.len());
             hi = star_hi;
             pi = sp + 1;
         } else {
@@ -187,14 +214,28 @@ fn glob_at(h: &[u8], pat: &[u8]) -> bool {
 
 /// 搜索结果排序键。派生 `Ord` 按字段先后、各字段升序比较，`bool` 的 `false < true`，
 /// 故命中项一律用否定语义（`not_*`，命中 = `false` 排在前）。
-/// 顺序：完全匹配 > 前缀匹配 > 目录 > 浅路径 > 名称字母序。
+/// 顺序：完全匹配 > 主名完全匹配（`report` 命中 `report.pdf`）> 前缀匹配 > 目录 >
+/// 浅路径 > 名称字母序。
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ScoreKey {
     not_exact: bool,
+    not_stem_exact: bool,
     not_prefix: bool,
     not_dir: bool,
     depth: u16,
     name_lower: Vec<u8>,
+}
+
+/// 文件主名（去掉最后一个扩展名）。目录没有扩展名的概念，返回完整名字。
+#[inline]
+fn stem_of(name: &[u8], is_dir: bool) -> &[u8] {
+    if is_dir {
+        return name;
+    }
+    match name.iter().rposition(|&b| b == b'.') {
+        Some(pos) if pos > 0 => &name[..pos],
+        _ => name,
+    }
 }
 
 /// 候选收集上限：兜底极端泛查询（如单字符），限制内存/CPU。
@@ -519,6 +560,8 @@ impl Index {
             }
             let name_lower: Vec<u8> = nb.iter().map(|b| b.to_ascii_lowercase()).collect();
             let not_exact = !(single_plain && name_lower == terms[0].lower);
+            let not_stem_exact =
+                !(single_plain && stem_of(&name_lower, is_dir) == terms[0].lower.as_slice());
             let not_prefix = if terms[0].has_wild {
                 true
             } else {
@@ -527,6 +570,7 @@ impl Index {
             out.push((
                 ScoreKey {
                     not_exact,
+                    not_stem_exact,
                     not_prefix,
                     not_dir: !is_dir,
                     depth: self.depth_of(id),
@@ -887,6 +931,73 @@ mod tests {
         assert_eq!(idx.search("*.txt", Category::All, 10).len(), 2);
         assert_eq!(idx.search("re?ort*", Category::All, 10).len(), 1);
         assert_eq!(idx.search("rep*final", Category::All, 10).len(), 1);
+    }
+
+    #[test]
+    fn suffix_wildcard_anchors_to_name_end() {
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, 0, "a.txt");
+        b.push(101, 5, 0, "a.txt.bak");
+        b.push(102, 5, 0, "txt.txt");
+        let idx = b.finish();
+        let names = |q: &str| -> Vec<String> {
+            let mut v: Vec<String> =
+                idx.search(q, Category::All, 10).into_iter().map(|r| r.name).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names("*.txt"), ["a.txt", "txt.txt"]);
+        // 回溯：第一个 .txt 处模式已用尽但名字未尽，继续尝试后面的 .txt
+        assert!(glob_at(b"a.txt.txt", b"*.txt", true));
+        assert_eq!(names("*.TXT"), ["a.txt", "txt.txt"]);
+        // 以 * 结尾或不以 * 开头的模式仍是子串语义
+        assert_eq!(names("*.txt*"), ["a.txt", "a.txt.bak", "txt.txt"]);
+        assert_eq!(names("a.t?t"), ["a.txt", "a.txt.bak"]);
+        assert_eq!(names("*.ba?"), ["a.txt.bak"]);
+    }
+
+    #[test]
+    fn question_mark_matches_whole_utf8_char() {
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, 0, "报告.txt");
+        b.push(101, 5, 0, "报.txt");
+        let idx = b.finish();
+        assert_eq!(idx.search("报?.txt", Category::All, 10)[0].name, "报告.txt");
+        assert_eq!(idx.search("报?.txt", Category::All, 10).len(), 1);
+        assert_eq!(idx.search("*告?txt", Category::All, 10).len(), 1);
+        // 一个汉字只算一个 ?，不会因从字符中间开始而多算
+        assert!(glob_at("报".as_bytes(), b"?", true));
+        assert!(!glob_at("报".as_bytes(), b"??", true));
+        assert!(!wildcard_contains_ci("报".as_bytes(), b"??", false));
+        assert!(wildcard_contains_ci("报告".as_bytes(), b"??", false));
+    }
+
+    #[test]
+    fn full_width_space_splits_terms() {
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, 0, "报告 2024.txt");
+        b.push(101, 5, 0, "报告.txt");
+        let idx = b.finish();
+        assert_eq!(compile_query("报告\u{3000}2024").len(), 2);
+        let r = idx.search("2024\u{3000}报告", Category::All, 10);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].name, "报告 2024.txt");
+    }
+
+    #[test]
+    fn stem_exact_ranks_before_longer_prefix() {
+        let mut b = IndexBuilder::new(b'C');
+        b.push(100, 5, 0, "reporting.txt");
+        b.push(101, 5, 0, "report.pdf");
+        b.push(102, 5, 0, "report");
+        b.push(103, 5, FILE_ATTRIBUTE_DIRECTORY, "report.v2");
+        let idx = b.finish();
+        let r = idx.search("report", Category::All, 10);
+        assert_eq!(r[0].name, "report");
+        assert_eq!(r[1].name, "report.pdf");
+        // 目录名里的点不算扩展名，report.v2 和 reporting.txt 一样只是前缀匹配，目录在前
+        assert_eq!(r[2].name, "report.v2");
+        assert_eq!(r[3].name, "reporting.txt");
     }
 
     #[test]
