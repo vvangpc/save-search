@@ -575,14 +575,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let is_hint = SUI.with(|c| c.borrow().as_ref().is_some_and(|u| u.hint.0 as isize == lp.0));
             SetTextColor(hdc, COLORREF(if is_hint { t.err } else { t.fg }));
             SetBkMode(hdc, TRANSPARENT);
-            return LRESULT(theme::solid_brush(t.bg).0 as isize);
+            LRESULT(theme::solid_brush(t.bg).0 as isize)
         }
         WM_ERASEBKGND => {
             let t = theme::current();
             let mut rc = RECT::default();
             let _ = GetClientRect(hwnd, &mut rc);
             FillRect(HDC(wp.0 as *mut c_void), &rc, theme::solid_brush(t.bg));
-            return LRESULT(1);
+            LRESULT(1)
         }
         WM_DPICHANGED => {
             on_dpi_changed(hwnd, wp, lp);

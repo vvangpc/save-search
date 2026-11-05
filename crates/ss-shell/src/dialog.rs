@@ -142,12 +142,7 @@ pub fn is_file_dialog(hwnd: HWND) -> bool {
     has_child_class(hwnd, &["ComboBoxEx32", "DUIViewWndClassName"])
 }
 
-/// 让文件对话框导航到目录 `path`（仅切换文件夹，不保存，保留原文件名）。
-pub fn navigate_dialog(hwnd: HWND, path: &str) -> bool {
-    navigate_dialog_checked(hwnd, path).is_ok()
-}
-
-/// 同 [`navigate_dialog`]，失败时说明原因。
+/// 让文件对话框导航到目录 `path`（仅切换文件夹，不保存，保留原文件名）。失败时说明原因。
 pub fn navigate_dialog_checked(hwnd: HWND, path: &str) -> Result<(), NavError> {
     unsafe {
         let uia = create_uia().map_err(nav_error_from)?;

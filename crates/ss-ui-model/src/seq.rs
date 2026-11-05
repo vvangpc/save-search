@@ -7,7 +7,7 @@ pub struct RequestSeq {
 
 impl RequestSeq {
     /// 发起新请求，之前的请求全部过期。
-    pub fn next(&mut self) -> u64 {
+    pub fn begin(&mut self) -> u64 {
         self.latest += 1;
         self.latest
     }
@@ -24,9 +24,9 @@ mod tests {
     #[test]
     fn only_latest_request_is_current() {
         let mut s = RequestSeq::default();
-        let a = s.next();
+        let a = s.begin();
         assert!(s.is_current(a));
-        let b = s.next();
+        let b = s.begin();
         assert!(!s.is_current(a));
         assert!(s.is_current(b));
     }

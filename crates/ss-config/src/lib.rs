@@ -386,26 +386,9 @@ pub fn try_save_settings(s: &Settings) -> io::Result<()> {
     update_settings(|current| *current = s.clone())
 }
 
-/// 保存整份设置，忽略写盘错误。需要知道结果时用 [`try_save_settings`]。
-pub fn save_settings(s: &Settings) {
-    log_write_error("settings.json", try_save_settings(s));
-}
-
 /// 读取上次搜索词（跨程序重启）。
 pub fn last_query() -> String {
     settings_store().read(|s| s.last_query.clone())
-}
-
-/// 保存上次搜索词；与当前值相同则不写盘（避免无谓 IO）。
-pub fn save_last_query(q: &str) {
-    log_write_error(
-        "settings.json",
-        update_settings(|s| {
-            if s.last_query != q {
-                s.last_query = q.to_string();
-            }
-        }),
-    );
 }
 
 #[cfg(test)]

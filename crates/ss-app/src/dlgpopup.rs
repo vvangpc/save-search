@@ -710,7 +710,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let hdc = HDC(wp.0 as *mut c_void);
             SetTextColor(hdc, COLORREF(t.fg));
             SetBkMode(hdc, TRANSPARENT);
-            return LRESULT(theme::solid_brush(t.bg).0 as isize);
+            LRESULT(theme::solid_brush(t.bg).0 as isize)
         }
         WM_COMMAND => {
             let code = ((wp.0 as u32) >> 16) & 0xFFFF;

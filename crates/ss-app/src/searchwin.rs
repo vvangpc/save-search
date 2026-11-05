@@ -797,7 +797,7 @@ fn start_search(keep_position: bool) {
     };
     let query = get_text(edit);
     let q = query.trim().to_string();
-    let seq = UI.with(|c| c.borrow_mut().as_mut().map(|u| u.seq.next())).unwrap_or(0);
+    let seq = UI.with(|c| c.borrow_mut().as_mut().map(|u| u.seq.begin())).unwrap_or(0);
     if q.is_empty() || !ready {
         search_worker::submit(None);
         let (rows, tags) = if q.is_empty() { home_rows() } else { (Vec::new(), Vec::new()) };
@@ -2073,7 +2073,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             SetTextColor(hdc, COLORREF(t.fg));
             SetBkMode(hdc, TRANSPARENT);
             let bg = if msg == WM_CTLCOLORLISTBOX { t.alt_bg } else { t.bg };
-            return LRESULT(theme::solid_brush(bg).0 as isize);
+            LRESULT(theme::solid_brush(bg).0 as isize)
         }
         WM_ERASEBKGND => {
             let t = theme::current();

@@ -30,17 +30,6 @@ pub struct OpenFolder {
     pub path: String,
 }
 
-/// 返回去重后的已打开资源管理器文件夹路径列表。失败返回空。
-pub fn enumerate_open_folders() -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for folder in collect_open_folders() {
-        if !out.iter().any(|p| p.eq_ignore_ascii_case(&folder.path)) {
-            out.push(folder.path);
-        }
-    }
-    out
-}
-
 /// 返回已打开的资源管理器文件夹，最上层的窗口在前，相同路径只保留最上层的。失败返回空。
 pub fn enumerate_open_folders_by_z_order() -> Vec<OpenFolder> {
     let folders = collect_open_folders();

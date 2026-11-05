@@ -7,17 +7,12 @@ fn main() {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
-    let folders = ss_shell::enumerate_open_folders();
-    let out = format!(
-        "已打开的资源管理器文件夹 ({}):\n{}\n",
-        folders.len(),
-        folders.join("\n")
-    );
-    print!("{out}");
-    println!("按 Z 序（最上层在前）：");
-    for f in ss_shell::enumerate_open_folders_by_z_order() {
-        println!("{:#x} {}", f.hwnd, f.path);
+    let folders = ss_shell::enumerate_open_folders_by_z_order();
+    let mut out = format!("已打开的资源管理器文件夹 ({})，最上层在前：\n", folders.len());
+    for f in &folders {
+        out.push_str(&format!("{:#x} {}\n", f.hwnd, f.path));
     }
+    print!("{out}");
     if let Some(p) = std::env::args().nth(1) {
         let _ = std::fs::write(p, out);
     }

@@ -1,7 +1,6 @@
 //! SaveSearch 主程序：常驻后台托盘应用。
 //!
-//! 阶段0 骨架：DPI 感知 + 隐藏窗口 + 系统托盘图标 + 右键菜单（退出）+ 消息循环。
-//! 后续阶段在此编排索引线程、热键、Shell 钩子、搜索窗与浮窗。
+//! 在这里编排托盘、索引线程、热键、Shell 钩子、搜索窗与浮窗。
 
 #![windows_subsystem = "windows"]
 
@@ -183,7 +182,7 @@ pub(crate) fn load_app_icon(cx: i32, cy: i32) -> Option<HICON> {
         // windows-rs 0.62 无 MAKEINTRESOURCEW：数字资源 id 用伪指针 PCWSTR(id as _)。
         let h = LoadImageW(
             Some(HINSTANCE(hmod.0)),
-            PCWSTR(1usize as *const u16),
+            PCWSTR(std::ptr::dangling::<u16>()),
             IMAGE_ICON,
             cx,
             cy,
@@ -557,11 +556,10 @@ unsafe extern "system" fn win_event_proc(
                 dlgpopup::on_foreground(hwnd);
             }
         }
-        EVENT_OBJECT_HIDE | EVENT_OBJECT_DESTROY => {
-            if dlgpopup::current_dialog() == Some(hwnd) {
+        EVENT_OBJECT_HIDE | EVENT_OBJECT_DESTROY
+            if dlgpopup::current_dialog() == Some(hwnd) => {
                 dlgpopup::hide();
             }
-        }
         _ => {}
     }
 }
