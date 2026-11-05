@@ -69,3 +69,49 @@
 - 已知限制：右键菜单中只有 `open`、`edit`、`print` 转交 Explorer。其他菜单项（如第三方的“用 XX 打开”）在本进程内执行，它们启动的程序会继承管理员权限。
 - 验证：构建和测试通过。首次运行示例时发现 `GetItemObject` 不接受直接请求 `IShellFolderViewDual`，已改为先取 `IDispatch`，修复后用测试脚本确认能启动且工作目录正确。这次运行没有管理员权限，所以还不能证明降权有效。
 - 需要用户手动验证：在管理员终端运行 `target\release\examples\actions.exe open C:\Windows\System32\notepad.exe`，确认任务管理器“提升的”一列为“否”。另外用 `reveal`、`copy`、`props`、`menu` 各试一次，其中 `menu` 要确认“打开方式”“发送到”子菜单能展开。
+
+### 步骤 10：对话框导航加固
+
+- 提交：`b9994b9`
+- 结果：按计划完成。恢复逻辑抽成纯函数 `restore_step`，并有单元测试。
+- 计划外补充：路径完整出现后等 250 ms 才写回。回车排在路径字符后面，马上写回原文件名的话，对话框可能按原文件名保存。到达 1.5 秒上限仍未完成时不写入。
+- 验证：构建和测试通过，ss-shell 测试增至 8 个，其中一个确认 UIA 超时已设置。运行 `examples/folders.rs`，能列出已打开的文件夹和窗口句柄。
+- 未验证：超时映射只用构造的错误码测试过，没有用真实挂起的程序触发。
+- 需要用户手动验证：记事本、浏览器上传、Office 保存三种对话框的跳转；目标程序繁忙时文件名不丢失。
+
+### 步骤 11：热路径编译优化实验
+
+- 提交：本步骤的 `build:` 提交，只包含实验记录。
+- 结果：未达到保留标准（搜索至少快 20%），已还原 `Cargo.toml`。exe 增长符合要求，但搜索提速不够。
+- 数据：`ss-core`、`memchr` 设为 `opt-level = 3`，exe 从 686,080 字节增至 718,848 字节（+4.8%）。每个查询取 3 次运行的中位：
+
+| 查询 | `opt-level = "z"` | `opt-level = 3` | 提速 |
+|---|---|---|---|
+| `a` | 13.70 ms | 11.26 ms | 17.8% |
+| `e` | 15.72 ms | 12.57 ms | 20.0% |
+| `report` | 12.01 ms | 10.18 ms | 15.2% |
+| `报告` | 7.71 ms | 6.42 ms | 16.7% |
+| `*.txt` | 25.72 ms | 23.10 ms | 10.2% |
+| `report final` | 10.70 ms | 9.38 ms | 12.3% |
+| `zzzznotfound` | 6.91 ms | 5.93 ms | 14.2% |
+
+- 验证：还原后 exe 回到 686,080 字节，构建和测试通过。
+
+## 批次一小结
+
+全部 11 个步骤已提交到 `optimize/ui-and-core`，没有推送、打标签或发布。最终测试：ss-config 10 个，ss-core 43 个（另有 1 个 ignored 的性能测试，已单独运行通过），ss-platform 1 个，ss-shell 8 个。
+
+**用户验收清单：**
+
+1. 回填 `audit.md` 的实盘基线：管理员终端运行 `target\baseline\cat.exe explorer` 和 `target\baseline\cache.exe`。`cargo clean` 会删除这些程序。
+2. 实盘索引：管理员终端运行 `target\release\examples\volumes.exe <缓存目录>`，确认能看到 Loading、Building、Ready 事件。
+3. 降权：管理员终端运行 `target\release\examples\actions.exe open C:\Windows\System32\notepad.exe`，确认任务管理器“提升的”一列为“否”。
+4. 其他结果操作：用同一个示例试 `reveal`、`copy`、`props`、`menu`。
+5. 对话框导航：记事本、浏览器上传、Office 保存三种对话框；目标程序繁忙时文件名不丢失。
+6. 升级：启动新版程序，确认旧缓存触发一次全量重建，搜索和增量更新正常。
+
+**前端批次需要知道的变化：**
+
+- 音视频和程序文件在旧界面只能从“全部”标签找到。
+- 旧设置页的结果上限输入值会被限制到 20 到 5000。
+- `Index::apply` 和 `apply_all` 增加了返回值，旧调用方不受影响。

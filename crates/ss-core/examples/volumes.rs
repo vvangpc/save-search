@@ -22,7 +22,7 @@ fn main() {
     let cat = Catalog::build_or_load_with_progress(cache_dir.as_ref(), &[], &|letter, state| {
         // 进度事件很多，只打印每 50 个中的一个
         if matches!(state, DriveState::Building { .. })
-            && building_events.fetch_add(1, Ordering::Relaxed) % 50 != 0
+            && !building_events.fetch_add(1, Ordering::Relaxed).is_multiple_of(50)
         {
             return;
         }
