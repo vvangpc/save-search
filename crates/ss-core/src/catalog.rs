@@ -397,6 +397,10 @@ impl Catalog {
     pub fn memory_bytes(&self) -> usize {
         self.indexes.iter().map(|i| i.memory_bytes()).sum()
     }
+    /// 每个盘的节点数：（盘符，节点数）。
+    pub fn drive_node_counts(&self) -> Vec<(char, usize)> {
+        self.indexes.iter().map(|i| (i.drive_letter(), i.len())).collect()
+    }
 
     /// 把预设文件夹路径解析为 (盘下标, 目录节点 id)，带单条缓存 + 有效性校验。
     fn resolve_folder(&self, folder: &str) -> Option<(usize, u32)> {
@@ -615,6 +619,15 @@ mod tests {
         let d = cat.query(&req("report", Scope::Drive('d')));
         assert_eq!(d.items[0].path, "D:\\Work\\report_d.txt");
         assert_eq!(d.total_hits, 1);
+    }
+
+    #[test]
+    fn node_counts_are_per_drive() {
+        let cat = sample_catalog();
+        let counts = cat.drive_node_counts();
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts.iter().map(|c| c.1).sum::<usize>(), cat.total_nodes());
+        assert_eq!(counts[0].0, 'C');
     }
 
     #[test]

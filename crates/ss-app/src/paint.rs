@@ -6,11 +6,17 @@
 
 use std::cell::Cell;
 
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{COLORREF, RECT, SIZE};
+use windows::core::w;
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, SelectObject,
-    HBITMAP, HDC, HGDIOBJ, SRCCOPY,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, DeleteDC, DeleteObject,
+    DrawTextW, FillRect, GetDC, GetTextExtentPoint32W, ReleaseDC, SelectObject, SetBkMode,
+    SetPixelV, SetTextColor, ANTIALIASED_QUALITY, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DRAW_TEXT_FORMAT, HBITMAP, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, SRCCOPY,
+    TRANSPARENT,
 };
+
+use crate::theme;
 
 thread_local! {
     /// (内存 DC, 位图, 宽, 高)；DC 为空表示无缓存。
@@ -92,4 +98,106 @@ pub unsafe fn buffered<F: FnOnce(HDC, RECT)>(hdc: HDC, rc: RECT, f: F) {
     SelectObject(mem, old);
     let _ = DeleteObject(HGDIOBJ(bmp.0));
     let _ = DeleteDC(mem);
+}
+
+/// 把 `fg` 按覆盖率 `a`（0 到 1）叠到 `bg` 上。颜色是 COLORREF。
+fn blend(bg: u32, fg: u32, a: f32) -> u32 {
+    let mix = |shift: u32| {
+        let b = ((bg >> shift) & 0xFF) as f32;
+        let f = ((fg >> shift) & 0xFF) as f32;
+        ((b + (f - b) * a + 0.5) as u32) << shift
+    };
+    mix(0) | mix(8) | mix(16)
+}
+
+/// 画抗锯齿的圆角矩形。GDI 的 `RoundRect` 有锯齿，所以四个角逐像素按覆盖率混色。
+/// `bg` 是矩形后面的颜色，`border` 是 1 像素的边框色。
+pub unsafe fn round_rect(hdc: HDC, r: RECT, radius: i32, fill: u32, border: Option<u32>, bg: u32) {
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let rad = radius.min(w / 2).min(h / 2).max(0);
+    let brush = theme::solid_brush(fill);
+    let middle = RECT { left: r.left + rad, top: r.top, right: r.right - rad, bottom: r.bottom };
+    FillRect(hdc, &middle, brush);
+    let sides = RECT { left: r.left, top: r.top + rad, right: r.right, bottom: r.bottom - rad };
+    FillRect(hdc, &sides, brush);
+    let edge = border.unwrap_or(fill);
+    if let Some(b) = border {
+        let line = theme::solid_brush(b);
+        for s in [
+            RECT { left: r.left + rad, top: r.top, right: r.right - rad, bottom: r.top + 1 },
+            RECT { left: r.left + rad, top: r.bottom - 1, right: r.right - rad, bottom: r.bottom },
+            RECT { left: r.left, top: r.top + rad, right: r.left + 1, bottom: r.bottom - rad },
+            RECT { left: r.right - 1, top: r.top + rad, right: r.right, bottom: r.bottom - rad },
+        ] {
+            FillRect(hdc, &s, line);
+        }
+    }
+    let radius_f = rad as f32;
+    for dy in 0..rad {
+        for dx in 0..rad {
+            // 像素中心到圆角圆心的距离
+            let fx = radius_f - dx as f32 - 0.5;
+            let fy = radius_f - dy as f32 - 0.5;
+            let d = (fx * fx + fy * fy).sqrt();
+            let outer = (radius_f - d + 0.5).clamp(0.0, 1.0);
+            let mut color = blend(bg, edge, outer);
+            if border.is_some() {
+                let inner = (radius_f - 1.0 - d + 0.5).clamp(0.0, 1.0);
+                color = blend(color, fill, inner);
+            }
+            let c = COLORREF(color);
+            let _ = SetPixelV(hdc, r.left + dx, r.top + dy, c);
+            let _ = SetPixelV(hdc, r.right - 1 - dx, r.top + dy, c);
+            let _ = SetPixelV(hdc, r.left + dx, r.bottom - 1 - dy, c);
+            let _ = SetPixelV(hdc, r.right - 1 - dx, r.bottom - 1 - dy, c);
+        }
+    }
+}
+
+/// 画文字。文字为空时什么也不做。
+pub unsafe fn text(hdc: HDC, s: &str, rect: &mut RECT, color: u32, font: HFONT, flags: DRAW_TEXT_FORMAT) {
+    if s.is_empty() {
+        return;
+    }
+    SelectObject(hdc, HGDIOBJ(font.0));
+    SetTextColor(hdc, COLORREF(color));
+    SetBkMode(hdc, TRANSPARENT);
+    let mut buf: Vec<u16> = s.encode_utf16().collect();
+    DrawTextW(hdc, &mut buf, rect, flags);
+}
+
+/// 用指定字体测量文字的像素宽度。
+pub fn measure(font: HFONT, s: &str) -> i32 {
+    if s.is_empty() {
+        return 0;
+    }
+    unsafe {
+        let hdc = GetDC(None);
+        let old = SelectObject(hdc, HGDIOBJ(font.0));
+        let w: Vec<u16> = s.encode_utf16().collect();
+        let mut size = SIZE::default();
+        let _ = GetTextExtentPoint32W(hdc, &w, &mut size);
+        SelectObject(hdc, old);
+        ReleaseDC(None, hdc);
+        size.cx
+    }
+}
+
+/// 界面文字字体。
+pub unsafe fn ui_font(px: i32, weight: i32) -> HFONT {
+    CreateFontW(
+        -px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, 0, w!("Segoe UI"),
+    )
+}
+
+/// 图标字体。用灰度抗锯齿，小图标不会出现 ClearType 的彩色毛边。
+pub unsafe fn icon_font(px: i32, weight: i32) -> HFONT {
+    CreateFontW(
+        -px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        ANTIALIASED_QUALITY, 0, w!("Segoe MDL2 Assets"),
+    )
 }

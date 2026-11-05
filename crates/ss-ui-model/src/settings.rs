@@ -20,9 +20,9 @@ pub fn parse_recent_max(text: &str) -> Result<usize, String> {
 
 /// 索引管理一行的文字。
 pub fn index_stats(nodes: usize, memory_bytes: usize, synced_secs_ago: Option<u64>) -> String {
-    let mut s = format!("共 {} 个文件，占用内存 {} MB", compact(nodes), memory_bytes / 1_000_000);
+    let mut s = format!("共 {} 个文件 · 索引占用内存 {} MB", compact(nodes), memory_bytes / 1_000_000);
     if let Some(secs) = synced_secs_ago {
-        s.push('，');
+        s.push_str(" · ");
         s.push_str(&synced_text(secs));
     }
     s
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn stats_text() {
-        assert_eq!(index_stats(2_500_000, 102_300_000, Some(2)), "共 250 万 个文件，占用内存 102 MB，2 秒前更新");
-        assert_eq!(index_stats(10, 0, None), "共 10 个文件，占用内存 0 MB");
+        assert_eq!(index_stats(2_500_000, 102_300_000, Some(2)), "共 250 万 个文件 · 索引占用内存 102 MB · 2 秒前更新");
+        assert_eq!(index_stats(10, 0, None), "共 10 个文件 · 索引占用内存 0 MB");
     }
 }

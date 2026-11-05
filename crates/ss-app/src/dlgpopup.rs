@@ -19,13 +19,11 @@ use ss_ui_model::{
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
-    InvalidateRect,
-    MonitorFromWindow,
-    ScreenToClient, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    DEFAULT_CHARSET, DRAW_TEXT_FORMAT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_PATH_ELLIPSIS,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, HGDIOBJ, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, FillRect, GetMonitorInfoW,
+    InvalidateRect, MonitorFromWindow, ScreenToClient, SetBkMode, SetTextColor,
+    SetWindowRgn, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_PATH_ELLIPSIS, DT_RIGHT,
+    DT_SINGLELINE, DT_VCENTER, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -33,7 +31,8 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::{icons, theme};
+use crate::paint::text as draw_text;
+use crate::theme;
 
 const WM_APP_OPEN_FOLDERS: u32 = WM_APP + 20;
 const WM_APP_DEAD_PATHS: u32 = WM_APP + 21;
@@ -44,6 +43,10 @@ const LOADING_TIMEOUT_MS: u32 = 3000;
 static READER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 const LIST_ID: u32 = 201;
+/// 行高和列表四周的留白（96 DPI）。
+const ITEM_H: i32 = 42;
+const INSET: i32 = 6;
+const MAX_WIDTH: i32 = 480;
 const LBN_SELCHANGE: u32 = 1;
 const IDM_FAV: u32 = 1;
 const LB_SETITEMHEIGHT: u32 = 0x01A0;
@@ -51,7 +54,7 @@ const LB_ITEMFROMPOINT: u32 = 0x01A9;
 
 mod st {
     pub const WS_POPUP: u32 = 0x8000_0000;
-    pub const WS_BORDER: u32 = 0x0080_0000;
+    pub const WS_CLIPCHILDREN: u32 = 0x0200_0000;
     pub const WS_CHILD: u32 = 0x4000_0000;
     pub const WS_VISIBLE: u32 = 0x1000_0000;
     pub const WS_VSCROLL: u32 = 0x0020_0000;
@@ -77,6 +80,8 @@ struct Popup {
     font_icon: HFONT,
     item_h: i32,
     dpi: i32,
+    /// Windows 11 由系统画圆角；更早的系统用窗口区域裁剪。
+    rounded_by_system: bool,
 }
 
 thread_local! {
@@ -85,13 +90,6 @@ thread_local! {
 
 fn send(hwnd: HWND, msg: u32, w: usize, l: isize) -> isize {
     unsafe { SendMessageW(hwnd, msg, Some(WPARAM(w)), Some(LPARAM(l))).0 }
-}
-
-unsafe fn make_font(px: i32, weight: i32, face: PCWSTR) -> HFONT {
-    CreateFontW(
-        -px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, 0, face,
-    )
 }
 
 fn sc(v: i32) -> i32 {
@@ -104,6 +102,8 @@ pub fn init() -> windows::core::Result<()> {
         let hinstance = HINSTANCE(GetModuleHandleW(None)?.0);
         let class = w!("SaveSearchDlgPopup");
         let wc = WNDCLASSW {
+            // 阴影让浮窗和对话框分开
+            style: CS_DROPSHADOW,
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance,
             lpszClassName: class,
@@ -116,7 +116,7 @@ pub fn init() -> windows::core::Result<()> {
             WINDOW_EX_STYLE(st::WS_EX_TOPMOST | st::WS_EX_TOOLWINDOW | st::WS_EX_NOACTIVATE),
             class,
             w!(""),
-            WINDOW_STYLE(st::WS_POPUP | st::WS_BORDER),
+            WINDOW_STYLE(st::WS_POPUP | st::WS_CLIPCHILDREN),
             0,
             0,
             320,
@@ -150,10 +150,11 @@ pub fn init() -> windows::core::Result<()> {
         )?;
 
         let dpi = GetDpiForWindow(hwnd).max(96) as i32;
-        let font_name = make_font(dpi * 14 / 96, 600, w!("Segoe UI"));
-        let font_path = make_font(dpi * 11 / 96, 400, w!("Segoe UI"));
-        let font_icon = make_font(dpi * 13 / 96, 400, w!("Segoe MDL2 Assets"));
+        let font_name = crate::paint::ui_font(dpi * 14 / 96, 400);
+        let font_path = crate::paint::ui_font(dpi * 12 / 96, 400);
+        let font_icon = crate::paint::icon_font(dpi * 13 / 96, 400);
 
+        let rounded_by_system = theme::round_corners(hwnd);
         POPUP.with(|c| {
             *c.borrow_mut() = Some(Popup {
                 hwnd,
@@ -165,15 +166,15 @@ pub fn init() -> windows::core::Result<()> {
                 font_name,
                 font_path,
                 font_icon,
-                item_h: dpi * 40 / 96,
+                item_h: dpi * ITEM_H / 96,
                 dpi,
+                rounded_by_system,
             });
         });
         // LBS_OWNERDRAWFIXED 的 WM_MEASUREITEM 在控件创建时发出，彼时 POPUP 尚未
         // 初始化、行高取了 96dpi 兜底值 40，高 DPI 下与 reposition 的窗口尺寸计算
         // 不一致（条目偏矮、底部留白）；这里用真实 DPI 重设。
-        send(list, LB_SETITEMHEIGHT, 0, (dpi * 40 / 96) as isize);
-        theme::apply_window(hwnd);
+        send(list, LB_SETITEMHEIGHT, 0, (dpi * ITEM_H / 96) as isize);
         Ok(())
     }
 }
@@ -187,30 +188,32 @@ fn set_entries(entries: Vec<PopupEntry>) {
     let Some((_, list)) = popup_handles() else {
         return;
     };
-    let changed = POPUP.with(|c| {
+    let old_paths = POPUP.with(|c| {
         let mut b = c.borrow_mut();
-        let Some(p) = b.as_mut() else {
-            return false;
-        };
+        let p = b.as_mut()?;
         if p.entries == entries {
-            return false;
+            return None;
         }
+        let old = p.entries.iter().map(|e| e.path.clone()).collect::<Vec<String>>();
         p.entries = entries;
-        true
+        Some(old)
     });
-    if !changed {
+    let Some(old_paths) = old_paths else {
         return;
-    }
+    };
     let count = POPUP.with(|c| c.borrow().as_ref().map_or(0, |p| p.entries.len()));
     let top = send(list, LB_GETTOPINDEX, 0, 0);
     let sel = send(list, LB_GETCURSEL, 0, 0);
+    let sel = usize::try_from(sel).ok().and_then(|i| old_paths.get(i)).and_then(|old| {
+        POPUP.with(|c| c.borrow().as_ref().and_then(|p| p.entries.iter().position(|e| &e.path == old)))
+    });
     send(list, WM_SETREDRAW, 0, 0);
     send(list, LB_RESETCONTENT, 0, 0);
     for _ in 0..count {
         send(list, LB_ADDSTRING, 0, 0);
     }
-    if sel >= 0 && (sel as usize) < count {
-        send(list, LB_SETCURSEL, sel as usize, 0);
+    if let Some(i) = sel {
+        send(list, LB_SETCURSEL, i, 0);
     }
     send(list, LB_SETTOPINDEX, top.max(0) as usize, 0);
     send(list, WM_SETREDRAW, 1, 0);
@@ -338,12 +341,13 @@ fn reposition(dialog: HWND, hwnd: HWND, list: HWND) {
             return;
         }
         let count = send(list, LB_GETCOUNT, 0, 0).max(1) as i32;
-        let item_h = POPUP.with(|c| c.borrow().as_ref().map(|p| p.item_h).unwrap_or(40));
-        let w = (r.right - r.left).clamp(sc(300), sc(640));
+        let item_h = POPUP.with(|c| c.borrow().as_ref().map(|p| p.item_h).unwrap_or(ITEM_H));
+        let w = (r.right - r.left).clamp(sc(300), sc(MAX_WIDTH));
         let notice_h = POPUP.with(|c| {
-            c.borrow().as_ref().map_or(0, |p| if p.notice.is_some() { sc(28) } else { 0 })
+            c.borrow().as_ref().map_or(0, |p| if p.notice.is_some() { sc(30) } else { 0 })
         });
-        let h = (count.min(12) * item_h + sc(6)).clamp(sc(44), sc(420)) + notice_h;
+        let inset = sc(INSET);
+        let h = count.min(10) * item_h + inset * 2 + notice_h;
         // 相对对话框水平居中
         let mut x = r.left + (r.right - r.left - w) / 2;
         let mut y = r.bottom + sc(2);
@@ -365,7 +369,14 @@ fn reposition(dialog: HWND, hwnd: HWND, list: HWND) {
             x = x.clamp(wr.left, (wr.right - w).max(wr.left));
         }
         let _ = MoveWindow(hwnd, x, y, w, h, true);
-        let _ = MoveWindow(list, 0, notice_h, w, h - notice_h, true);
+        let _ = MoveWindow(list, inset, inset + notice_h, w - inset * 2, h - inset * 2 - notice_h, true);
+        let by_system = POPUP.with(|c| c.borrow().as_ref().is_some_and(|p| p.rounded_by_system));
+        if !by_system {
+            let d = sc(10);
+            let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, d, d);
+            SetWindowRgn(hwnd, Some(rgn), true);
+        }
+        let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
 
@@ -492,14 +503,16 @@ unsafe fn paint_notice(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
     let t = theme::current();
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    FillRect(hdc, &rc, theme::solid_brush(t.bg));
     let state = POPUP.with(|c| c.borrow().as_ref().map(|p| (p.notice.clone(), p.font_path)));
     if let Some((Some(text), font)) = state {
-        let mut rc = RECT::default();
-        let _ = GetClientRect(hwnd, &mut rc);
-        rc.bottom = rc.top + sc(28);
-        FillRect(hdc, &rc, theme::solid_brush(t.err_bg));
+        let inset = sc(INSET);
+        let band = RECT { left: rc.left + inset, top: rc.top + inset, right: rc.right - inset, bottom: rc.top + inset + sc(26) };
+        crate::paint::round_rect(hdc, band, sc(6), t.err_bg, None, t.bg);
         SetBkMode(hdc, TRANSPARENT);
-        let mut tr = RECT { left: rc.left + sc(10), top: rc.top, right: rc.right - sc(10), bottom: rc.bottom };
+        let mut tr = RECT { left: band.left + sc(10), right: band.right - sc(10), ..band };
         draw_text(hdc, &text, &mut tr, t.err, font, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
     }
     let _ = EndPaint(hwnd, &ps);
@@ -553,22 +566,9 @@ unsafe fn show_context_menu(popup_hwnd: HWND, x: i32, y: i32) {
 
 // ---- 自绘 ----
 
-unsafe fn draw_text(hdc: HDC, s: &str, rect: &mut RECT, color: u32, font: HFONT, flags: DRAW_TEXT_FORMAT) {
-    if s.is_empty() {
-        return;
-    }
-    SelectObject(hdc, HGDIOBJ(font.0));
-    SetTextColor(hdc, COLORREF(color));
-    let mut buf: Vec<u16> = s.encode_utf16().collect();
-    DrawTextW(hdc, &mut buf, rect, flags);
-}
-
 unsafe fn draw_item(dis: &DRAWITEMSTRUCT) {
     let t = theme::current();
     let selected = dis.itemState.0 & ODS_SELECTED.0 != 0;
-    let bg = if selected { t.sel_bg } else { t.bg };
-    let fg = if selected { t.sel_fg } else { t.fg };
-    let path_fg = if selected { t.sel_fg } else { t.path_fg };
     let entry = if dis.itemID == u32::MAX {
         None
     } else {
@@ -582,59 +582,49 @@ unsafe fn draw_item(dis: &DRAWITEMSTRUCT) {
         .unwrap_or((null_font, null_font, null_font));
 
     crate::paint::buffered(dis.hDC, dis.rcItem, |hdc, rc| unsafe {
-        FillRect(hdc, &rc, theme::solid_brush(bg));
+        FillRect(hdc, &rc, theme::solid_brush(t.bg));
         let Some(entry) = &entry else {
             return;
         };
         SetBkMode(hdc, TRANSPARENT);
-        let pad = sc(8);
+        let pad = sc(10);
         if entry.source == EntrySource::Loading {
             let mut lr = RECT { left: rc.left + pad, top: rc.top, right: rc.right - pad, bottom: rc.bottom };
             draw_text(hdc, "正在读取已打开的资源管理器文件夹…", &mut lr, t.path_fg, fn_path, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
             return;
         }
+        let row_bg = if selected && !entry.dead { t.sel_bg } else { t.bg };
+        if row_bg != t.bg {
+            crate::paint::round_rect(hdc, rc, sc(6), row_bg, None, t.bg);
+        }
+        let name_fg = if entry.dead { t.path_fg } else { t.fg };
         let path = &entry.path;
-        let icon = sc(18);
-        let icy = rc.top + (rc.bottom - rc.top - icon) / 2;
-        if let Some(hicon) = icons::icon_for("folder", true) {
-            let _ = DrawIconEx(hdc, rc.left + pad, icy, hicon, icon, icon, 0, None, DI_NORMAL);
+        // 第一列是星标，只有收藏才有
+        let star_w = sc(18);
+        if entry.source == EntrySource::Favorite {
+            let mut sr = RECT { left: rc.left + pad, top: rc.top, right: rc.left + pad + star_w, bottom: rc.bottom };
+            let color = if entry.dead { t.thumb } else { t.star };
+            draw_text(hdc, "\u{E735}", &mut sr, color, fn_icon, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
         }
-        let name_fg = if entry.dead { path_fg } else { fg };
-        let tx = rc.left + pad + icon + pad;
-        let tag_w = sc(56);
-        let mut r1 = RECT {
-            left: tx,
-            top: rc.top + sc(3),
-            right: rc.right - tag_w,
-            bottom: rc.top + (rc.bottom - rc.top) / 2 + sc(2),
+        let source = match (entry.source, entry.dead) {
+            (EntrySource::Favorite, true) => "收藏（已失效）",
+            (_, true) => "已失效",
+            (EntrySource::Favorite, false) => "收藏",
+            (EntrySource::Recent, false) => "最近",
+            (EntrySource::Open, false) => "已打开",
+            (EntrySource::Loading, false) => "",
         };
-        draw_text(hdc, leaf_of(path), &mut r1, name_fg, fn_name, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
-        let mut r2 = RECT {
-            left: tx,
-            top: rc.top + (rc.bottom - rc.top) / 2 - sc(2),
-            right: rc.right - tag_w,
-            bottom: rc.bottom - sc(2),
-        };
-        draw_text(hdc, parent_of(path), &mut r2, path_fg, fn_path, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_PATH_ELLIPSIS);
+        let source_w = crate::paint::measure(fn_path, source);
+        let mut rt = RECT { left: rc.right - pad - source_w, top: rc.top, right: rc.right - pad, bottom: rc.bottom };
+        draw_text(hdc, source, &mut rt, t.path_fg, fn_path, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
-        // 来源标记：收藏用一颗实心星，其余用浅色文字
-        let mut rt = RECT {
-            left: rc.right - tag_w,
-            top: rc.top,
-            right: rc.right - sc(10),
-            bottom: rc.bottom,
-        };
-        let flags = DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
-        if entry.dead {
-            draw_text(hdc, "已失效", &mut rt, path_fg, fn_path, flags);
-        } else {
-            match entry.source {
-                EntrySource::Favorite => draw_text(hdc, "\u{E735}", &mut rt, t.star, fn_icon, flags),
-                EntrySource::Recent => draw_text(hdc, "最近", &mut rt, path_fg, fn_path, flags),
-                EntrySource::Open => draw_text(hdc, "已打开", &mut rt, path_fg, fn_path, flags),
-                EntrySource::Loading => {}
-            }
-        }
+        let tx = rc.left + pad + star_w + sc(6);
+        let right = rt.left - sc(10);
+        let mid = rc.top + (rc.bottom - rc.top) / 2;
+        let mut r1 = RECT { left: tx, top: rc.top + sc(3), right, bottom: mid + sc(2) };
+        draw_text(hdc, leaf_of(path), &mut r1, name_fg, fn_name, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        let mut r2 = RECT { left: tx, top: mid - sc(1), right, bottom: rc.bottom - sc(3) };
+        draw_text(hdc, parent_of(path), &mut r2, t.path_fg, fn_path, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_PATH_ELLIPSIS);
     });
 }
 
@@ -667,10 +657,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DPICHANGED => {
             // 位置和大小跟随对话框，由 relayout 计算，不用系统建议的矩形
             let dpi = ((wp.0 & 0xFFFF) as i32).max(96);
-            let font_name = make_font(dpi * 14 / 96, 600, w!("Segoe UI"));
-            let font_path = make_font(dpi * 11 / 96, 400, w!("Segoe UI"));
-            let font_icon = make_font(dpi * 13 / 96, 400, w!("Segoe MDL2 Assets"));
-            let item_h = dpi * 40 / 96;
+            let font_name = crate::paint::ui_font(dpi * 14 / 96, 400);
+            let font_path = crate::paint::ui_font(dpi * 12 / 96, 400);
+            let font_icon = crate::paint::icon_font(dpi * 13 / 96, 400);
+            let item_h = dpi * ITEM_H / 96;
             let old = POPUP.with(|c| {
                 c.borrow_mut().as_mut().map(|p| {
                     let old = [p.font_name, p.font_path, p.font_icon];
@@ -694,7 +684,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MEASUREITEM => {
             let mis = &mut *(lp.0 as *mut MEASUREITEMSTRUCT);
-            let h = POPUP.with(|c| c.borrow().as_ref().map(|p| p.item_h).unwrap_or(40));
+            let h = POPUP.with(|c| c.borrow().as_ref().map(|p| p.item_h).unwrap_or(ITEM_H));
             mis.itemHeight = h as u32;
             LRESULT(1)
         }

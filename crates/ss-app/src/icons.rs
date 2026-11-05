@@ -3,7 +3,6 @@
 //! 图标在后台线程加载，加载好后通知界面重绘，尚未加载时调用方不画图标。
 //! 图标数量有界（每种扩展名一个 + 文件夹一个），缓存到进程退出，OS 在退出时回收。
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -21,7 +20,7 @@ const DIR_KEY: &str = "\u{1}dir";
 const NO_EXT_KEY: &str = "\u{1}none";
 
 /// 键 → 图标句柄。0 表示正在加载或加载失败。
-static CACHE: Mutex<Option<HashMap<String, isize>>> = Mutex::new(None);
+static CACHE: Mutex<Vec<(String, isize)>> = Mutex::new(Vec::new());
 static REQUESTS: WorkQueue<String> = WorkQueue::new();
 
 fn wide(s: &str) -> Vec<u16> {
@@ -67,9 +66,11 @@ pub fn start(on_loaded: fn()) {
         loop {
             let key = REQUESTS.pop();
             let icon = load_icon(&key);
-            if let Some(map) = CACHE.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
-                map.insert(key, icon);
+            let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = cache.iter_mut().find(|(k, _)| *k == key) {
+                entry.1 = icon;
             }
+            drop(cache);
             if icon != 0 {
                 on_loaded();
             }
@@ -90,13 +91,12 @@ pub fn icon_for(name: &str, is_dir: bool) -> Option<HICON> {
             e
         }
     };
-    let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    let map = guard.get_or_insert_with(HashMap::new);
-    if let Some(&h) = map.get(&key) {
-        return (h != 0).then_some(HICON(h as *mut c_void));
+    let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((_, h)) = cache.iter().find(|(k, _)| *k == key) {
+        return (*h != 0).then_some(HICON(*h as *mut c_void));
     }
-    map.insert(key.clone(), 0);
-    drop(guard);
+    cache.push((key.clone(), 0));
+    drop(cache);
     REQUESTS.push(key);
     None
 }

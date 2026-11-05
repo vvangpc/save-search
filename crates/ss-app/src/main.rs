@@ -398,10 +398,9 @@ fn main() -> windows::core::Result<()> {
         {
             let catalog3 = catalog.clone();
             std::thread::spawn(move || {
-                use std::collections::HashMap;
                 use std::time::Instant;
                 // 防重建风暴：单盘重建（无论成败）后至少间隔 6 小时再评估
-                let mut last_rebuild: HashMap<char, Instant> = HashMap::new();
+                let mut last_rebuild: Vec<(char, Instant)> = Vec::new();
                 loop {
                     std::thread::sleep(Duration::from_secs(2));
                     let positions = match catalog3.read().as_ref() {
@@ -436,12 +435,13 @@ fn main() -> windows::core::Result<()> {
                     };
                     for letter in need {
                         if last_rebuild
-                            .get(&letter)
-                            .is_some_and(|t| t.elapsed() < Duration::from_secs(6 * 3600))
+                            .iter()
+                            .any(|(l, t)| *l == letter && t.elapsed() < Duration::from_secs(6 * 3600))
                         {
                             continue;
                         }
-                        last_rebuild.insert(letter, Instant::now());
+                        last_rebuild.retain(|(l, _)| *l != letter);
+                        last_rebuild.push((letter, Instant::now()));
                         if let Ok(idx) = ss_core::build_index_for_drive(letter) {
                             if let Some(c) = catalog3.write().as_mut() {
                                 c.replace_index(idx);
@@ -504,7 +504,7 @@ fn main() -> windows::core::Result<()> {
                 searchwin::toggle();
                 continue;
             }
-            if searchwin::pretranslate(&msg) {
+            if searchwin::pretranslate(&msg) || settings_win::pretranslate(&msg) {
                 continue;
             }
             let _ = TranslateMessage(&msg);

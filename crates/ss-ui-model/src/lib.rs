@@ -9,7 +9,7 @@ mod settings;
 mod status;
 mod text;
 
-pub use scroll::{ease_toward, ListGeometry};
+pub use scroll::{ease_toward, scroll_from_thumb, scroll_thumb, ListGeometry};
 pub use selection::{moved, reselect, SelMove};
 pub use popup::{
     initial_entries, leaf_of, mark_dead, merge_open, without_loading, EntrySource, PopupEntry,

@@ -1,4 +1,5 @@
-//! 快选浮窗的条目：收藏和最近先显示，已打开的文件夹异步补在后面，已有条目的位置不变。
+//! 快选浮窗的条目，顺序是收藏、已打开、最近。
+//! 已打开的文件夹异步读取，读到后插到最近位置之前，同组内已有条目的相对顺序不变。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntrySource {
@@ -39,11 +40,11 @@ pub fn initial_entries(
     for p in favorites {
         push_unique(&mut out, EntrySource::Favorite, p);
     }
-    for p in recent {
-        push_unique(&mut out, EntrySource::Recent, p);
-    }
     for p in open {
         push_unique(&mut out, EntrySource::Open, p);
+    }
+    for p in recent {
+        push_unique(&mut out, EntrySource::Recent, p);
     }
     if loading {
         out.push(PopupEntry { source: EntrySource::Loading, path: String::new(), dead: false });
@@ -51,20 +52,21 @@ pub fn initial_entries(
     out
 }
 
-/// 用最新读到的已打开文件夹更新条目：去掉已关闭的，新的补在最后，其余顺序不变。
+/// 用最新读到的已打开文件夹更新条目：去掉已关闭的，新的排在已打开组的最后。
+/// 已经在收藏里的路径不变；出现在最近里的路径改归已打开组。
 pub fn merge_open(entries: &[PopupEntry], open: &[String]) -> Vec<PopupEntry> {
-    let mut out: Vec<PopupEntry> = entries
-        .iter()
-        .filter(|e| match e.source {
-            EntrySource::Loading => false,
-            EntrySource::Open => open.iter().any(|p| same_path(p, &e.path)),
-            _ => true,
-        })
-        .cloned()
-        .collect();
+    let is_open = |path: &str| open.iter().any(|p| same_path(p, path));
+    let mut out: Vec<PopupEntry> =
+        entries.iter().filter(|e| e.source == EntrySource::Favorite).cloned().collect();
+    out.extend(entries.iter().filter(|e| e.source == EntrySource::Open && is_open(&e.path)).cloned());
     for p in open {
         push_unique(&mut out, EntrySource::Open, p);
     }
+    let dead = |path: &str| entries.iter().any(|e| e.dead && same_path(&e.path, path));
+    for e in out.iter_mut() {
+        e.dead = dead(&e.path);
+    }
+    out.extend(entries.iter().filter(|e| e.source == EntrySource::Recent && !is_open(&e.path)).cloned());
     out
 }
 
@@ -106,17 +108,19 @@ mod tests {
         let e = initial_entries(&s(&["C:\\a"]), &s(&["c:\\A\\", "C:\\b"]), &s(&["C:\\b", "C:\\c"]), true);
         assert_eq!(paths(&e), ["C:\\a", "C:\\b", "C:\\c", ""]);
         assert_eq!(e[0].source, EntrySource::Favorite);
-        assert_eq!(e[1].source, EntrySource::Recent);
+        assert_eq!(e[1].source, EntrySource::Open);
         assert_eq!(e[2].source, EntrySource::Open);
         assert_eq!(e[3].source, EntrySource::Loading);
     }
 
     #[test]
-    fn merge_keeps_positions_and_appends_new_folders() {
-        let e = initial_entries(&s(&["C:\\fav"]), &s(&["C:\\rec"]), &s(&["C:\\o1", "C:\\o2"]), true);
+    fn merge_keeps_groups_and_order() {
+        let e = initial_entries(&s(&["C:\\fav"]), &s(&["C:\\rec", "C:\\r2"]), &s(&["C:\\o1", "C:\\o2"]), true);
         let m = merge_open(&e, &s(&["C:\\o3", "C:\\o2", "C:\\REC"]));
-        // o1 已关闭；o2 留在原位；o3 补在最后；已存在的最近位置不重复
-        assert_eq!(paths(&m), ["C:\\fav", "C:\\rec", "C:\\o2", "C:\\o3"]);
+        // o1 已关闭；o2 排在前面；新读到的 o3 和 rec 排在已打开组后面；r2 仍在最近组
+        assert_eq!(paths(&m), ["C:\\fav", "C:\\o2", "C:\\o3", "C:\\REC", "C:\\r2"]);
+        assert_eq!(m[3].source, EntrySource::Open);
+        assert_eq!(m[4].source, EntrySource::Recent);
     }
 
     #[test]
