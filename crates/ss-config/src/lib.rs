@@ -262,6 +262,22 @@ pub fn record_recent(path: &str) {
 
 // ---- 设置 ----
 
+/// 快选浮窗的分类底色。颜色为 Windows COLORREF（0x00BBGGRR）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PopupColors {
+    pub enabled: bool,
+    pub open: u32,
+    pub favorite: u32,
+    pub recent: u32,
+}
+
+impl Default for PopupColors {
+    fn default() -> Self {
+        Self { enabled: true, open: 0x00FFF4ED, favorite: 0x00E5F4FF, recent: 0x00F0F7ED }
+    }
+}
+
 /// 全局设置（settings.json）。`#[serde(default)]` 保证旧文件缺字段时用默认值。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -283,6 +299,7 @@ pub struct Settings {
     pub popup_show_favorites: bool,
     pub popup_show_recent: bool,
     pub popup_show_open: bool,
+    pub popup_colors: PopupColors,
     /// 上次搜索词（跨重启记忆，启动时预填搜索框）
     pub last_query: String,
     /// 呼出搜索窗的全局热键，如 `Alt+Space`
@@ -310,6 +327,7 @@ impl Default for Settings {
             popup_show_favorites: true,
             popup_show_recent: true,
             popup_show_open: true,
+            popup_colors: PopupColors::default(),
             last_query: String::new(),
             hotkey: DEFAULT_HOTKEY.into(),
             last_scope: String::new(),
@@ -327,6 +345,9 @@ impl Settings {
     fn normalize(&mut self) {
         self.result_limit = self.result_limit.clamp(20, 5000);
         self.recent_max = self.recent_max.min(50);
+        self.popup_colors.open &= 0x00FF_FFFF;
+        self.popup_colors.favorite &= 0x00FF_FFFF;
+        self.popup_colors.recent &= 0x00FF_FFFF;
         if self.hotkey.trim().is_empty() {
             self.hotkey = DEFAULT_HOTKEY.into();
         }
@@ -474,6 +495,16 @@ mod tests {
             let legacy = format!(r#"{{"enter_action":"{value}"}}"#);
             assert_eq!(parse_settings(legacy.as_bytes()).unwrap(), Settings::default());
         }
+    }
+
+    #[test]
+    fn popup_colors_are_backward_compatible_and_roundtrip() {
+        let defaults = PopupColors::default();
+        assert_eq!(parse_settings(b"{}").unwrap().popup_colors, defaults);
+        let partial = parse_settings(br#"{"popup_colors":{"open":4294967295,"enabled":false}}"#).unwrap();
+        assert_eq!(partial.popup_colors, PopupColors { enabled: false, open: 0x00FF_FFFF, ..defaults });
+        let bytes = serde_json::to_vec(&partial).unwrap();
+        assert_eq!(parse_settings(&bytes).unwrap(), partial);
     }
 
     #[test]

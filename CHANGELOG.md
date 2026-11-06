@@ -6,6 +6,23 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-06
+
+### 新增
+
+- 快选浮窗支持分别设置已打开、收藏、最近打开的底色，可关闭分类底色或恢复默认。
+- 快选浮窗悬停提示完整文件夹名称和路径，便于查看被省略的长文本。
+
+### 变更
+
+- 快选浮窗按“已打开、收藏、最近打开”排列，重复路径优先归入已打开组，关闭后恢复其收藏或最近归属。
+- 快选浮窗改为上下分层：名称在上，完整路径位于下方独立浅色带；移除收藏图标及左侧占位。
+- 快选浮窗行高收紧至56逻辑像素，最多显示6条；上下空间不足时按完整行缩减高度，更多条目可滚动查看。
+
+### 修复
+
+- 修复应用图标加载时使用了错误的资源编号，导致托盘和窗口图标不显示的问题。
+
 ## [0.4.1] - 2026-11-05
 
 ### 变更
@@ -145,7 +162,8 @@
 
 - 首个版本：NTFS 文件搜索、保存和打开对话框位置快选、托盘常驻。
 
-[Unreleased]: https://github.com/vvangpc/save-search/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/vvangpc/save-search/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/vvangpc/save-search/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/vvangpc/save-search/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/vvangpc/save-search/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/vvangpc/save-search/compare/v0.2.3...v0.3.0

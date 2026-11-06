@@ -179,10 +179,11 @@ pub(crate) fn load_app_icon(cx: i32, cy: i32) -> Option<HICON> {
         } else {
             LR_SHARED
         };
-        // windows-rs 0.62 无 MAKEINTRESOURCEW：数字资源 id 用伪指针 PCWSTR(id as _)。
+        // MAKEINTRESOURCEW(1)：地址数值就是 app.rc 中的资源编号，不是可解引用的指针。
+        // 不能用 dangling::<u16>() 代替：它的地址是对齐值 2，会误查不存在的资源 2。
         let h = LoadImageW(
             Some(HINSTANCE(hmod.0)),
-            PCWSTR(std::ptr::dangling::<u16>()),
+            PCWSTR(std::ptr::without_provenance::<u16>(1)),
             IMAGE_ICON,
             cx,
             cy,

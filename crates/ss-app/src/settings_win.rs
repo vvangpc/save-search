@@ -25,6 +25,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Controls::Dialogs::{ChooseColorW, CHOOSECOLORW, CC_FULLOPEN, CC_RGBINIT};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
@@ -65,6 +66,20 @@ enum Flag {
     ShowFavorites,
     ShowRecent,
     ShowOpen,
+    PopupColors,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupColor { Open, Favorite, Recent }
+
+impl PopupColor {
+    fn value_mut(self, colors: &mut ss_config::PopupColors) -> &mut u32 {
+        match self {
+            Self::Open => &mut colors.open,
+            Self::Favorite => &mut colors.favorite,
+            Self::Recent => &mut colors.recent,
+        }
+    }
 }
 
 /// 可编辑的文件夹列表。
@@ -85,6 +100,8 @@ enum Hit {
     FavUp(usize),
     FavDown(usize),
     FavRemove(usize),
+    Color(PopupColor),
+    ResetColors,
     Save,
     Cancel,
 }
@@ -141,6 +158,7 @@ struct SUi {
     show_favorites: bool,
     show_recent: bool,
     show_open: bool,
+    popup_colors: ss_config::PopupColors,
     stats: String,
     hotkey_hint: Option<String>,
     limit_hint: Option<String>,
@@ -165,6 +183,7 @@ impl SUi {
             Flag::ShowFavorites => &mut self.show_favorites,
             Flag::ShowRecent => &mut self.show_recent,
             Flag::ShowOpen => &mut self.show_open,
+            Flag::PopupColors => &mut self.popup_colors.enabled,
         }
     }
 
@@ -425,6 +444,7 @@ unsafe fn create() -> windows::core::Result<()> {
             show_favorites: s.popup_show_favorites,
             show_recent: s.popup_show_recent,
             show_open: s.popup_show_open,
+            popup_colors: s.popup_colors,
             stats: stats_text(),
             hotkey_hint,
             limit_hint: None,
@@ -539,6 +559,19 @@ impl Walk<'_> {
         }
         self.text(s, r, self.t.fg, font, DT_CENTER);
         self.hits.push((r, hit));
+    }
+
+    /// 分类名称和可点击的底色色块。
+    unsafe fn color_button(&mut self, title: &str, x: i32, y: i32, w: i32, color: u32, enabled: bool, hit: Hit) {
+        let r = self.rect(x, y, w, 30);
+        let swatch = self.rect(x + w - 38, y + 2, 32, 26);
+        if let Some(hdc) = self.hdc {
+            let edge = if enabled && self.u.hover == Some(hit) { self.t.accent } else { self.t.border };
+            let fill = if enabled { color } else { self.t.alt_bg };
+            paint::round_rect(hdc, swatch, self.sc(4), fill, Some(edge), self.t.bg);
+        }
+        self.label(title, x, y, w - 44, 30);
+        if enabled { self.hits.push((r, hit)); }
     }
 
     /// 输入框的圆角外框。文字由真实的 EDIT 控件显示。
@@ -674,10 +707,20 @@ impl Walk<'_> {
         y += 30;
         self.label("显示内容", SIDE, y, 100, 24);
         let mut x = FIELD_X;
-        x += self.check("收藏", x, y, u.show_favorites, u.popup, Hit::Flag(Flag::ShowFavorites)) + 14;
         x += self.check("已打开", x, y, u.show_open, u.popup, Hit::Flag(Flag::ShowOpen)) + 14;
-        self.check("最近", x, y, u.show_recent, u.popup, Hit::Flag(Flag::ShowRecent));
+        x += self.check("收藏", x, y, u.show_favorites, u.popup, Hit::Flag(Flag::ShowFavorites)) + 14;
+        self.check("最近打开", x, y, u.show_recent, u.popup, Hit::Flag(Flag::ShowRecent));
         y += 32;
+        self.label("分类底色", SIDE, y, 100, 24);
+        self.check("按状态显示底色", FIELD_X, y, u.popup_colors.enabled, u.popup, Hit::Flag(Flag::PopupColors));
+        if u.popup { self.button("恢复默认", FIELD_X + field_w - 80, y, Hit::ResetColors); }
+        y += 32;
+        let color_w = field_w / 3;
+        let colors_enabled = u.popup && u.popup_colors.enabled;
+        self.color_button("已打开", FIELD_X, y, color_w, u.popup_colors.open, colors_enabled, Hit::Color(PopupColor::Open));
+        self.color_button("收藏", FIELD_X + color_w, y, color_w, u.popup_colors.favorite, colors_enabled, Hit::Color(PopupColor::Favorite));
+        self.color_button("最近打开", FIELD_X + color_w * 2, y, color_w, u.popup_colors.recent, colors_enabled, Hit::Color(PopupColor::Recent));
+        y += 40;
         self.label("最近条数", SIDE, y, 100, INPUT_H);
         self.input(2, FIELD_X, y, 240, u.recent_hint.is_some());
         y += INPUT_H + 3;
@@ -870,6 +913,7 @@ fn apply_and_close() {
             popup_show_favorites: u.show_favorites,
             popup_show_recent: u.show_recent,
             popup_show_open: u.show_open,
+            popup_colors: u.popup_colors,
             // 设置页不编辑的字段保持原值
             ..ss_config::load_settings()
         };
@@ -945,6 +989,34 @@ unsafe fn run_hit(hit: Hit) {
                     let v = u.flag_mut(f);
                     *v = !*v;
                 }
+            });
+            invalidate_content();
+        }
+        Hit::Color(which) => {
+            let Some((hwnd, mut colors)) = SUI.with(|c| c.borrow().as_ref().map(|u| (u.hwnd, u.popup_colors))) else { return };
+            let mut custom = [COLORREF(0x00FF_FFFF); 16];
+            custom[..3].copy_from_slice(&[COLORREF(colors.open), COLORREF(colors.favorite), COLORREF(colors.recent)]);
+            let mut dialog = CHOOSECOLORW {
+                lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+                hwndOwner: hwnd,
+                rgbResult: COLORREF(*which.value_mut(&mut colors)),
+                lpCustColors: custom.as_mut_ptr(),
+                Flags: CC_RGBINIT | CC_FULLOPEN,
+                ..Default::default()
+            };
+            // 系统颜色对话框会重入消息循环；期间不能持有 SUI 的借用。
+            if ChooseColorW(&mut dialog).as_bool() {
+                SUI.with(|c| {
+                    if let Some(u) = c.borrow_mut().as_mut() {
+                        *which.value_mut(&mut u.popup_colors) = dialog.rgbResult.0;
+                    }
+                });
+                invalidate_content();
+            }
+        }
+        Hit::ResetColors => {
+            SUI.with(|c| {
+                if let Some(u) = c.borrow_mut().as_mut() { u.popup_colors = ss_config::PopupColors::default(); }
             });
             invalidate_content();
         }

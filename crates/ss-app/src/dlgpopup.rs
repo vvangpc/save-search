@@ -1,4 +1,4 @@
-//! 保存/打开对话框下方的浮窗：自绘双行（文件夹图标 + 文件夹名 + 灰色父路径 + 来源标记）。
+//! 保存/打开对话框下方的浮窗：名称在上、完整路径在独立的浅色带中，右侧标明来源。
 //!
 //! 无边框置顶、`WS_EX_NOACTIVATE`（点击不抢对话框焦点）。单击导航且保留浮窗，对话框关闭才消失。
 //!
@@ -12,11 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ss_shell::NavError;
 use ss_ui_model::{
-    initial_entries, leaf_of, mark_dead, merge_open, parent_of, without_loading, EntrySource,
+    initial_entries, leaf_of, mark_dead, merge_open, without_loading, EntrySource,
     PopupEntry,
 };
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateRoundRectRgn, DeleteObject, EndPaint, FillRect, GetMonitorInfoW,
@@ -28,7 +28,13 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECTED};
+use windows::Win32::UI::Controls::{
+    InitCommonControlsEx, INITCOMMONCONTROLSEX, ICC_WIN95_CLASSES,
+    DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECTED, TOOLTIPS_CLASSW, TTTOOLINFOW,
+    TTF_SUBCLASS, TTM_ADDTOOLW, TTM_DELTOOLW, TTM_NEWTOOLRECTW, TTM_SETMAXTIPWIDTH,
+    TTS_ALWAYSTIP, TTS_NOPREFIX, TTM_POP,
+};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::paint::text as draw_text;
@@ -44,9 +50,10 @@ static READER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 const LIST_ID: u32 = 201;
 /// 行高和列表四周的留白（96 DPI）。
-const ITEM_H: i32 = 42;
+const ITEM_H: i32 = 56;
 const INSET: i32 = 6;
-const MAX_WIDTH: i32 = 480;
+const MAX_WIDTH: i32 = 620;
+const MAX_VISIBLE_ROWS: i32 = 6;
 const LBN_SELCHANGE: u32 = 1;
 const IDM_FAV: u32 = 1;
 const LB_SETITEMHEIGHT: u32 = 0x01A0;
@@ -73,6 +80,10 @@ struct Popup {
     entries: Vec<PopupEntry>,
     /// 上次读到的已打开文件夹，下次显示时先用它，避免列表跳动。
     open_cache: Vec<String>,
+    colors: ss_config::PopupColors,
+    tooltip: HWND,
+    /// 系统提示框引用这些 UTF-16 缓冲；删除工具后才能释放。
+    tooltip_text: Vec<Vec<u16>>,
     /// 跳转失败的提示，显示在列表上方。
     notice: Option<String>,
     font_name: HFONT,
@@ -149,8 +160,18 @@ pub fn init() -> windows::core::Result<()> {
         )?;
 
         let dpi = GetDpiForWindow(hwnd).max(96) as i32;
-        let font_name = crate::paint::ui_font(dpi * 14 / 96, 400);
+        let font_name = crate::paint::ui_font(dpi * 15 / 96, 600);
         let font_path = crate::paint::ui_font(dpi * 12 / 96, 400);
+        let _ = InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_WIN95_CLASSES,
+        });
+        let tooltip = CreateWindowExW(
+            WINDOW_EX_STYLE(st::WS_EX_TOPMOST | st::WS_EX_NOACTIVATE),
+            TOOLTIPS_CLASSW, PCWSTR::null(), WINDOW_STYLE(st::WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX),
+            0, 0, 0, 0, Some(hwnd), None, Some(hinstance), None,
+        )?;
+        send(tooltip, TTM_SETMAXTIPWIDTH, 0, (dpi * 620 / 96) as isize);
+        let _ = SetWindowSubclass(list, Some(list_subclass), 1, 0);
 
         let rounded_by_system = theme::round_corners(hwnd);
         POPUP.with(|c| {
@@ -160,6 +181,9 @@ pub fn init() -> windows::core::Result<()> {
                 dialog: HWND(std::ptr::null_mut()),
                 entries: Vec::new(),
                 open_cache: Vec::new(),
+                colors: ss_config::PopupColors::default(),
+                tooltip,
+                tooltip_text: Vec::new(),
                 notice: None,
                 font_name,
                 font_path,
@@ -178,6 +202,60 @@ pub fn init() -> windows::core::Result<()> {
 
 fn popup_handles() -> Option<(HWND, HWND)> {
     POPUP.with(|c| c.borrow().as_ref().map(|p| (p.hwnd, p.list)))
+}
+
+/// 每行有独立的提示区域，悬停能查看完整名称和路径。
+fn rebuild_tooltips() {
+    let Some((tooltip, list, old_count, entries)) = POPUP.with(|c| c.borrow().as_ref()
+        .map(|p| (p.tooltip, p.list, p.tooltip_text.len(), p.entries.clone()))) else { return };
+    send(tooltip, TTM_POP, 0, 0);
+    for i in 0..old_count {
+        let tool = TTTOOLINFOW { cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32, hwnd: list, uId: i + 1, ..Default::default() };
+        send(tooltip, TTM_DELTOOLW, 0, &tool as *const _ as isize);
+    }
+    let tools = POPUP.with(|c| {
+        let mut b = c.borrow_mut();
+        let Some(p) = b.as_mut() else { return Vec::new() };
+        p.tooltip_text = entries.iter().map(|e| crate::wide(&format!("{}\n{}", leaf_of(&e.path), e.path))).collect();
+        p.tooltip_text.iter_mut().enumerate().filter(|(i, _)| !entries[*i].path.is_empty()).map(|(i, text)| {
+            TTTOOLINFOW {
+                cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                uFlags: TTF_SUBCLASS,
+                hwnd: list,
+                uId: i + 1,
+                lpszText: PWSTR(text.as_mut_ptr()),
+                ..Default::default()
+            }
+        }).collect::<Vec<_>>()
+    });
+    for tool in tools { send(tooltip, TTM_ADDTOOLW, 0, &tool as *const _ as isize); }
+    update_tooltip_rects();
+}
+
+fn update_tooltip_rects() {
+    let Some((tooltip, list, count)) = POPUP.with(|c| c.borrow().as_ref()
+        .map(|p| (p.tooltip, p.list, p.tooltip_text.len()))) else { return };
+    let mut client = RECT::default();
+    let _ = unsafe { GetClientRect(list, &mut client) };
+    for i in 0..count {
+        let mut rect = RECT::default();
+        if send(list, LB_GETITEMRECT, i, &mut rect as *mut _ as isize) < 0 { continue; }
+        if rect.bottom <= 0 || rect.top >= client.bottom { rect = RECT::default(); }
+        else { rect.top = rect.top.max(0); rect.bottom = rect.bottom.min(client.bottom); }
+        let tool = TTTOOLINFOW { cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32, hwnd: list, uId: i + 1, rect, ..Default::default() };
+        send(tooltip, TTM_NEWTOOLRECTW, 0, &tool as *const _ as isize);
+    }
+}
+
+unsafe extern "system" fn list_subclass(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    let result = DefSubclassProc(hwnd, msg, wp, lp);
+    if matches!(msg, WM_VSCROLL | WM_MOUSEWHEEL | WM_KEYDOWN) {
+        if let Some(tip) = POPUP.with(|c| c.borrow().as_ref().map(|p| p.tooltip)) { send(tip, TTM_POP, 0, 0); }
+    }
+    if matches!(msg, WM_VSCROLL | WM_MOUSEWHEEL | WM_KEYDOWN | WM_SIZE | LB_SETTOPINDEX | LB_SETCURSEL) {
+        update_tooltip_rects();
+    }
+    result
 }
 
 /// 把条目放进列表。内容没有变化时不重灌，保留选中和滚动位置，也不闪烁。
@@ -214,6 +292,7 @@ fn set_entries(entries: Vec<PopupEntry>) {
     }
     send(list, LB_SETTOPINDEX, top.max(0) as usize, 0);
     send(list, WM_SETREDRAW, 1, 0);
+    rebuild_tooltips();
     let _ = unsafe { InvalidateRect(Some(list), None, true) };
 }
 
@@ -244,6 +323,7 @@ pub fn show_for(dialog: HWND) {
     POPUP.with(|c| {
         if let Some(p) = c.borrow_mut().as_mut() {
             p.dialog = dialog;
+            p.colors = s.popup_colors;
             if !same_dialog {
                 p.notice = None;
             }
@@ -295,10 +375,14 @@ fn start_reader(hwnd: HWND, read_open: bool, favorites: &[String], recent: &[Str
 }
 
 fn on_open_folders(open: Vec<String>) {
+    let s = ss_config::load_settings();
+    let favorites = if s.popup_show_favorites { ss_config::favorites() } else { Vec::new() };
+    let recent = if s.popup_show_recent { ss_config::recent() } else { Vec::new() };
     let merged = POPUP.with(|c| {
         c.borrow_mut().as_mut().map(|p| {
             p.open_cache = open.clone();
-            merge_open(&p.entries, &open)
+            let visible_open = if s.popup_show_open { open.as_slice() } else { &[] };
+            merge_open(&p.entries, visible_open, &favorites, &recent)
         })
     });
     let Some(merged) = merged else {
@@ -344,12 +428,14 @@ fn reposition(dialog: HWND, hwnd: HWND, list: HWND) {
             c.borrow().as_ref().map_or(0, |p| if p.notice.is_some() { sc(30) } else { 0 })
         });
         let inset = sc(INSET);
-        let h = count.min(10) * item_h + inset * 2 + notice_h;
+        let rows = count.min(MAX_VISIBLE_ROWS);
+        let chrome_h = inset * 2 + notice_h;
+        let mut h = rows * item_h + chrome_h;
         // 相对对话框水平居中
         let mut x = r.left + (r.right - r.left - w) / 2;
         let mut y = r.bottom + sc(2);
-        // 钳制到对话框所在显示器的工作区：对话框贴屏底时浮窗改放其上方，
-        // 上方也放不下则贴工作区顶（会盖住对话框上沿，两害取轻）；取失败走原逻辑
+        // 优先在对话框下方展示；上方能容纳全部条目时改放上方。
+        // 两侧都不够时减少可见条数，按完整行收缩；其余条目保留滚动访问。
         let hmon = MonitorFromWindow(dialog, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -357,16 +443,32 @@ fn reposition(dialog: HWND, hwnd: HWND, list: HWND) {
         };
         if GetMonitorInfoW(hmon, &mut mi).as_bool() {
             let wr = mi.rcWork;
-            if y + h > wr.bottom {
-                y = r.top - sc(2) - h;
+            let work_h = (wr.bottom - wr.top).max(1);
+            let gap = sc(2);
+            let below = (wr.bottom - r.bottom - gap).clamp(0, work_h);
+            let above = (r.top - gap - wr.top).clamp(0, work_h);
+            if below >= h {
+                y = r.bottom + gap;
+            } else if above >= h {
+                y = r.top - gap - h;
+            } else {
+                let below_rows = ((below - chrome_h).max(0) / item_h).min(rows);
+                let above_rows = ((above - chrome_h).max(0) / item_h).min(rows);
+                let visible_rows = below_rows.max(above_rows);
+                if visible_rows > 0 {
+                    h = visible_rows * item_h + chrome_h;
+                    y = if below_rows >= above_rows { r.bottom + gap } else { r.top - gap - h };
+                } else {
+                    // 对话框几乎铺满工作区时，至少保留一条可用行，避免浮窗撑满屏幕。
+                    h = (item_h + chrome_h).min(work_h);
+                }
             }
-            if y < wr.top {
-                y = wr.top;
-            }
+            y = y.clamp(wr.top, (wr.bottom - h).max(wr.top));
             x = x.clamp(wr.left, (wr.right - w).max(wr.left));
         }
         let _ = MoveWindow(hwnd, x, y, w, h, true);
         let _ = MoveWindow(list, inset, inset + notice_h, w - inset * 2, h - inset * 2 - notice_h, true);
+        update_tooltip_rects();
         let by_system = POPUP.with(|c| c.borrow().as_ref().is_some_and(|p| p.rounded_by_system));
         if !by_system {
             let d = sc(10);
@@ -421,6 +523,7 @@ pub fn current_dialog() -> Option<HWND> {
 
 pub fn hide() {
     if let Some((hwnd, _)) = popup_handles() {
+        if let Some(tip) = POPUP.with(|c| c.borrow().as_ref().map(|p| p.tooltip)) { send(tip, TTM_POP, 0, 0); }
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
@@ -563,6 +666,28 @@ unsafe fn show_context_menu(popup_hwnd: HWND, x: i32, y: i32) {
 
 // ---- 自绘 ----
 
+/// 任意自定义底色下仍保持文字可读，默认配色继续使用主题文字色。
+fn readable_on(bg: u32, preferred: u32) -> u32 {
+    let luminance = |color: u32| {
+        let channel = |shift: u32| {
+            let v = ((color >> shift) & 0xff) as f64 / 255.0;
+            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        channel(0) * 0.2126 + channel(8) * 0.7152 + channel(16) * 0.0722
+    };
+    let bg_l = luminance(bg);
+    let fg_l = luminance(preferred);
+    if (bg_l.max(fg_l) + 0.05) / (bg_l.min(fg_l) + 0.05) >= 4.5 { preferred }
+    else if bg_l > 0.179 { 0 } else { 0x00FF_FFFF }
+}
+
+fn path_band_color(row: u32, surface: u32) -> u32 {
+    let channel = |shift: u32| {
+        ((((row >> shift) & 0xff) + 4 * ((surface >> shift) & 0xff)) / 5) << shift
+    };
+    channel(0) | channel(8) | channel(16)
+}
+
 unsafe fn draw_item(dis: &DRAWITEMSTRUCT) {
     let t = theme::current();
     let selected = dis.itemState.0 & ODS_SELECTED.0 != 0;
@@ -574,9 +699,9 @@ unsafe fn draw_item(dis: &DRAWITEMSTRUCT) {
     // 兜底空 HFONT（POPUP 未初始化时 DC 用默认字体退化绘制），与其他绘制站点一致，
     // 避免 panic=abort 下裸 unwrap 拉死进程
     let null_font = HFONT(std::ptr::null_mut());
-    let (fn_name, fn_path) = POPUP
-        .with(|c| c.borrow().as_ref().map(|p| (p.font_name, p.font_path)))
-        .unwrap_or((null_font, null_font));
+    let (fn_name, fn_path, colors) = POPUP
+        .with(|c| c.borrow().as_ref().map(|p| (p.font_name, p.font_path, p.colors)))
+        .unwrap_or((null_font, null_font, ss_config::PopupColors::default()));
 
     crate::paint::buffered(dis.hDC, dis.rcItem, |hdc, rc| unsafe {
         FillRect(hdc, &rc, theme::solid_brush(t.bg));
@@ -590,46 +715,40 @@ unsafe fn draw_item(dis: &DRAWITEMSTRUCT) {
             draw_text(hdc, "正在读取已打开的资源管理器文件夹…", &mut lr, t.path_fg, fn_path, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
             return;
         }
-        let row_bg = if selected && !entry.dead { t.sel_bg } else { t.bg };
-        if row_bg != t.bg {
-            crate::paint::round_rect(hdc, rc, sc(6), row_bg, None, t.bg);
-        }
-        let name_fg = if entry.dead { t.path_fg } else { t.fg };
+        let row_bg = if entry.dead { t.alt_bg } else if !colors.enabled { t.bg } else {
+            match entry.source {
+                EntrySource::Open => colors.open,
+                EntrySource::Favorite => colors.favorite,
+                EntrySource::Recent => colors.recent,
+                EntrySource::Loading => t.bg,
+            }
+        };
+        let row = RECT { bottom: rc.bottom - sc(2), ..rc };
+        let border = (selected && !entry.dead).then_some(t.accent);
+        crate::paint::round_rect(hdc, row, sc(6), row_bg, border, t.bg);
+        let name_fg = readable_on(row_bg, if entry.dead { t.path_fg } else { t.fg });
         let path = &entry.path;
-        // 第一列是收藏标记，只有收藏才有
-        let mark_w = sc(18);
-        if entry.source == EntrySource::Favorite {
-            let top = rc.top + (rc.bottom - rc.top - mark_w) / 2;
-            let mark = RECT { left: rc.left + pad, top, right: rc.left + pad + mark_w, bottom: top + mark_w };
-            let (tile, glyph) = if entry.dead {
-                (t.alt_bg, t.thumb)
-            } else if selected {
-                // 选中行的底色和标记底色相同，这里换成白底才看得出来
-                (t.bg, t.accent)
-            } else {
-                (t.sel_bg, t.accent)
-            };
-            crate::paint::bookmark_icon(hdc, mark, tile, glyph, row_bg);
-        }
         let source = match (entry.source, entry.dead) {
             (EntrySource::Favorite, true) => "收藏（已失效）",
             (_, true) => "已失效",
             (EntrySource::Favorite, false) => "收藏",
-            (EntrySource::Recent, false) => "最近",
+            (EntrySource::Recent, false) => "最近打开",
             (EntrySource::Open, false) => "已打开",
             (EntrySource::Loading, false) => "",
         };
         let source_w = crate::paint::measure(fn_path, source);
-        let mut rt = RECT { left: rc.right - pad - source_w, top: rc.top, right: rc.right - pad, bottom: rc.bottom };
-        draw_text(hdc, source, &mut rt, t.path_fg, fn_path, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        let mut rt = RECT { left: rc.right - pad - source_w, top: rc.top + sc(4), right: rc.right - pad, bottom: rc.top + sc(24) };
+        draw_text(hdc, source, &mut rt, readable_on(row_bg, t.path_fg), fn_path, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
-        let tx = rc.left + pad + mark_w + sc(10);
+        let tx = rc.left + pad;
         let right = rt.left - sc(10);
-        let mid = rc.top + (rc.bottom - rc.top) / 2;
-        let mut r1 = RECT { left: tx, top: rc.top + sc(3), right, bottom: mid + sc(2) };
+        let mut r1 = RECT { left: tx, top: rc.top + sc(4), right, bottom: rc.top + sc(24) };
         draw_text(hdc, leaf_of(path), &mut r1, name_fg, fn_name, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
-        let mut r2 = RECT { left: tx, top: mid - sc(1), right, bottom: rc.bottom - sc(3) };
-        draw_text(hdc, parent_of(path), &mut r2, t.path_fg, fn_path, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_PATH_ELLIPSIS);
+        let band = RECT { left: tx, top: rc.top + sc(27), right: rc.right - pad, bottom: rc.bottom - sc(6) };
+        let band_bg = path_band_color(row_bg, t.bg);
+        crate::paint::round_rect(hdc, band, sc(3), band_bg, None, row_bg);
+        let mut r2 = RECT { left: band.left + sc(5), right: band.right - sc(5), ..band };
+        draw_text(hdc, path, &mut r2, readable_on(band_bg, t.path_fg), fn_path, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_PATH_ELLIPSIS);
     });
 }
 
@@ -662,9 +781,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DPICHANGED => {
             // 位置和大小跟随对话框，由 relayout 计算，不用系统建议的矩形
             let dpi = ((wp.0 & 0xFFFF) as i32).max(96);
-            let font_name = crate::paint::ui_font(dpi * 14 / 96, 400);
+            let font_name = crate::paint::ui_font(dpi * 15 / 96, 600);
             let font_path = crate::paint::ui_font(dpi * 12 / 96, 400);
-                let item_h = dpi * ITEM_H / 96;
+            let item_h = dpi * ITEM_H / 96;
             let old = POPUP.with(|c| {
                 c.borrow_mut().as_mut().map(|p| {
                     let old = [p.font_name, p.font_path];
@@ -677,6 +796,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             });
             for f in old.into_iter().flatten() {
                 let _ = DeleteObject(HGDIOBJ(f.0));
+            }
+            if let Some(tip) = POPUP.with(|c| c.borrow().as_ref().map(|p| p.tooltip)) {
+                send(tip, TTM_SETMAXTIPWIDTH, 0, (dpi * MAX_WIDTH / 96) as isize);
             }
             if let Some((_, list)) = popup_handles() {
                 send(list, LB_SETITEMHEIGHT, 0, item_h as isize);
